@@ -1,0 +1,50 @@
+# ============================================================================
+# WHITELIST MODE
+# Everything is ignored by default (the "*" below). Only files and
+# directories explicitly re-included with a "!" rule can be committed.
+#
+# To allow a new file:   add a "!" rule, e.g.  !tools/build.sh
+# To allow a directory:  un-ignore the dir first, then its contents,
+#                        e.g.  !patches/   then   !patches/**
+#
+# Remember: this repository must never contain Chinese (CJK) characters
+# anywhere -- file names, file content, or commit metadata. The hooks/
+# pre-push hook enforces this at push time (see README.md).
+# ============================================================================
+
+# --- ignore everything by default ----------------------------------------
+*
+
+# --- tracked baseline files ----------------------------------------------
+!.gitignore
+!README.md
+!LICENSE*
+
+# --- versioned hooks (enabled via: git config core.hooksPath hooks) -------
+!hooks/
+!hooks/**
+
+# --- build / shell scripts ------------------------------------------------
+!*.sh
+!*.mk
+!Makefile
+
+# --- kernel / bootloader configs and device trees --------------------------
+!*defconfig*
+!*.config
+!*.dts
+!*.dtsi
+
+# --- patches --------------------------------------------------------------
+!*.patch
+!*.diff
+
+# --- documentation --------------------------------------------------------
+!docs/
+!docs/**
+
+# --- example: allow a whole directory once it exists -----------------------
+#!patches/
+#!patches/**
+#!scripts/
+#!scripts/**

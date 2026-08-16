@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# ============================================================================
+# pre-push hook: hard gate against Chinese (CJK) characters.
+#
+# Blocks any push whose commits contain CJK characters in:
+#   - file names
+#   - file content
+#   - commit messages
+#   - author / committer names
+#
+# Scope: every non-merge commit in the pushed range (this catches files that
+# were added with CJK and later deleted), plus the final tree of the pushed
+# ref (this catches merge conflict resolutions). If grep -P cannot detect CJK
+# on this machine the hook fails closed: push is refused.
+#
+# Install with:  git config core.hooksPath hooks   (do this once per clone)
+# ============================================================================
+
+set -u
+LC_ALL=C.UTF-8
+export LC_ALL
+
+ZERO=0000000000000000000000000000000000000000
+
+# CJK blocks scanned:
+#   2E80-2EFF  CJK Radicals Supplement
+#   3000-303F  CJK Symbols and Punctuation
+#   3400-4DBF  CJK Unified Ideographs Extension A
+#   4E00-9FFF  CJK Unified Ideographs
+#   F900-FAFF  CJK Compatibility Ideographs
+#   FF00-FFEF  Halfwidth and Fullwidth Forms
+CJK_RE='[\x{2E80}-\x{2EFF}\x{3000}-\x{303F}\x{3400}-\x{4DBF}\x{4E00}-\x{9FFF}\x{F900}-\x{FAFF}\x{FF00}-\x{FFEF}]'
+
+fail=0
+
+# --- self test: if CJK detection is broken, refuse to run -------------------
+if ! printf '中' | grep -aP "$CJK_RE" >/dev/null 2>&1; then
+    echo "hooks/pre-push: FATAL: CJK detection (grep -P with UTF-8 locale)" >&2
+    echo "is not working on this machine. Push refused (fail closed)." >&2
+    exit 1
+fi
+
+# --- helpers -----------------------------------------------------------------
+
+# scan one blob: CJK in the path string and/or in the content on stdin.
+# returns 1 (violation) or 0 (clean); prints a report line to stderr.
+scan_blob() {
+    local path="$1"
+    local hit=0
+    if printf '%s' "$path" | grep -aP "$CJK_RE" >/dev/null 2>&1; then
+        echo "  CJK in file name: $path" >&2
+        hit=1
+    fi
+    if grep -aP "$CJK_RE" >/dev/null 2>&1; then
+        echo "  CJK in file content: $path" >&2
+        hit=1
+    fi
+    return "$hit"
+}
+
+# scan one commit: changed files (content + names) and commit metadata.
+# returns 1 (violation) or 0 (clean).
+scan_commit() {
+    local c="$1"
+    local path blob msg ident
+    local hit=0
+
+    while IFS= read -r -d '' path; do
+        blob="$(git rev-parse -q --verify "$c:$path" 2>/dev/null)"
+        if [ -z "$blob" ]; then
+            echo "hooks/pre-push: cannot resolve '$path' at commit $c; push refused (fail closed)" >&2
+            return 1
+        fi
+        if ! scan_blob "$path" < <(git cat-file blob "$blob" 2>/dev/null); then
+            hit=1
+        fi
+    done < <(git diff-tree --no-commit-id --name-only -r --diff-filter=ACMRT -z "$c")
+
+    msg="$(git log --format=%B -1 "$c" 2>/dev/null)"
+    if printf '%s' "$msg" | grep -aP "$CJK_RE" >/dev/null 2>&1; then
+        echo "  CJK in commit message: $(printf '%s' "$msg" | head -1)" >&2
+        hit=1
+    fi
+
+    ident="$(git log --format='%an <%ae> / %cn <%ce>' -1 "$c" 2>/dev/null)"
+    if printf '%s' "$ident" | grep -aP "$CJK_RE" >/dev/null 2>&1; then
+        echo "  CJK in author/committer identity: $ident" >&2
+        hit=1
+    fi
+
+    return "$hit"
+}
+
+# scan the full tree of one ref: every blob, including paths. Used on the tip
+# of each pushed ref so merge conflict resolutions are covered too.
+scan_tree() {
+    local rev="$1"
+    local line meta sha path
+    local hit=0
+
+    while IFS= read -r -d '' line; do
+        meta="${line%%$'\t'*}"
+        sha="$(printf '%s' "$meta" | awk '{print $3}')"
+        path="${line#*$'\t'}"
+        if ! scan_blob "$path" < <(git cat-file blob "$sha" 2>/dev/null); then
+            hit=1
+        fi
+    done < <(git ls-tree -r -z "$rev")
+
+    return "$hit"
+}
+
+# --- main --------------------------------------------------------------------
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "$local_sha" ] && continue
+    [ "$local_sha" = "$ZERO" ] && continue   # branch deletion: nothing uploaded
+
+    if [ "$remote_sha" = "$ZERO" ]; then
+        range="$local_sha"                   # new branch: whole history
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    while IFS= read -r c; do
+        [ -z "$c" ] && continue
+        if ! scan_commit "$c"; then
+            echo "  in commit $c" >&2
+            fail=1
+        fi
+    done < <(git rev-list --no-merges "$range" 2>/dev/null)
+
+    if ! scan_tree "$local_sha"; then
+        echo "  in pushed ref $local_ref" >&2
+        fail=1
+    fi
+done
+
+if [ "$fail" -eq 1 ]; then
+    echo "hooks/pre-push: PUSH REFUSED - the commits being uploaded contain" >&2
+    echo "Chinese (CJK) characters, which are not allowed in this repository." >&2
+    echo "Replace the flagged text with ASCII (or rename the flagged files)" >&2
+    echo "and commit again before pushing." >&2
+    exit 1
+fi
+
+exit 0
