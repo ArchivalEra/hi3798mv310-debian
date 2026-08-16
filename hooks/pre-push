@@ -34,7 +34,9 @@ CJK_RE='[\x{2E80}-\x{2EFF}\x{3000}-\x{303F}\x{3400}-\x{4DBF}\x{4E00}-\x{9FFF}\x{
 fail=0
 
 # --- self test: if CJK detection is broken, refuse to run -------------------
-if ! printf '中' | grep -aP "$CJK_RE" >/dev/null 2>&1; then
+# Note: the test character is fed as raw UTF-8 bytes (U+4E00) so that this
+# script itself stays pure ASCII.
+if ! printf '\xe4\xb8\xad' | grep -aP "$CJK_RE" >/dev/null 2>&1; then
     echo "hooks/pre-push: FATAL: CJK detection (grep -P with UTF-8 locale)" >&2
     echo "is not working on this machine. Push refused (fail closed)." >&2
     exit 1
