@@ -43,8 +43,8 @@
 !docs/
 !docs/**
 
-# --- example: allow a whole directory once it exists -----------------------
-#!patches/
-#!patches/**
-#!scripts/
-#!scripts/**
+# --- allowed directories ------------------------------------------------------
+!patches/
+!patches/**
+!scripts/
+!scripts/**

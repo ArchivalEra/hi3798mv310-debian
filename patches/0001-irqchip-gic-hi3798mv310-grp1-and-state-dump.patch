@@ -1,0 +1,112 @@
+From: ArchivalEra <archivalera@localhost>
+Date: Wed, 19 Aug 2026 12:00:00 +0800
+Subject: [PATCH] irqchip/gic: hi3798mv310: keep Group 1 enabled and dump
+ banked SGI/PPI state
+
+The hi3798mv310 board (poplar-derived hi3798mv2x TF-A, GIC-400,
+Cortex-A53 x4) deadlocks in SMP bringup because no GIC interrupt is
+ever delivered to any CPU.
+
+Runtime non-secure reads of the fully-initialized kernel show a GIC
+that looks correctly enabled (GICD_CTLR=0x1 in the NS view, IGROUPR0
+with SGIs and timer PPIs in Group 1, GICC_CTLR=0x3e3), so the two
+"findings" that motivated the previous fix attempts are retracted:
+
+ 1. "ISENABLER0 == 0 (SGIs never enabled)" was read from 0xf1001104,
+    which is GICD_ISENABLER1 (SPI 32-63).  That register reads 0 after
+    gic_dist_config() disables all SPIs - that is normal.  The real
+    GICD_ISENABLER0 is at dist+0x100 = 0xf1001100 and is written with
+    0xffff (GICD_INT_EN_SET_SGI) by gic_cpu_config() on every CPU.
+
+ 2. "GICD_CTLR == 0x1 means the kernel cleared EnableGrp1" is a
+    banked-view misread: in the non-secure view of GICD_CTLR, bit 0 is
+    the alias of EnableGrp1(NS), so 0x1 is the *good* state.
+
+Since the reference board (hi3798mv300) runs four cores, arch timer
+PPIs and SGIs with the same TF-A platform and an unmodified mainline
+kernel, none of the Group/enable theory explains the failure by
+itself.  This patch therefore:
+
+ - keeps the already-validated harmless belt-and-braces writes
+   (GICC_CTLR.EnableGrp1, GICD_CTLR bit 1, IGROUPR0 = all Group 1), and
+
+ - adds a one-shot per-CPU dump of the banked SGI/PPI state with the
+   register offsets spelled out in the message itself, so the next
+   serial log cannot be misread the same way.
+
+The decisive next experiments (software-pended PPI/SGI bisection from
+the initramfs) are documented in docs/mv310-gic-bisect-runbook.md.
+---
+ drivers/irqchip/irq-gic.c | 53 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 1 deletion(-)
+
+--- a/drivers/irqchip/irq-gic.c
++++ b/drivers/irqchip/irq-gic.c
+@@ -457,7 +457,15 @@
+ 	bypass = readl(cpu_base + GIC_CPU_CTRL);
+ 	bypass &= GICC_DIS_BYPASS_MASK;
+ 
+-	writel_relaxed(bypass | mode | GICC_ENABLE, cpu_base + GIC_CPU_CTRL);
++	/*
++	 * hi3798mv310: also set GICC_CTLR.EnableGrp1 (bit 1). The
++	 * poplar-derived BL31 only programs the secure view of the CPU
++	 * interface; in some banked configurations bit 1 is what gates
++	 * Group 1 delivery. For a plain non-secure GIC-400 view bit 0 is
++	 * already the EnableGrp1(NS) alias, so this is harmless.
++	 */
++	writel_relaxed(bypass | mode | GICC_ENABLE |
++		       GIC_CPU_CTRL_EnableGrp1, cpu_base + GIC_CPU_CTRL);
+ }
+ 
+ 
+@@ -481,7 +489,23 @@
+ 
+ 	gic_dist_config(base, gic_irqs, GICD_INT_DEF_PRI);
+ 
+-	writel_relaxed(GICD_ENABLE, base + GIC_DIST_CTRL);
++	/*
++	 * hi3798mv310: force SGI/PPI (INTID 0-31) into Group 1 in the
++	 * non-secure banked view. The poplar-derived BL31 only programs
++	 * the secure bank through gicv2_secure_ppi_sgi_setup_props();
++	 * whether the NS alias needs this write varies, but it is
++	 * harmless on GIC-400.
++	 */
++	writel_relaxed(0xffffffff, base + GIC_DIST_IGROUP);
++
++	/*
++	 * GICD_ENABLE is bit 0; in the non-secure view that bit is the
++	 * alias of EnableGrp1(NS). Also set GICD_CTLR.EnableGrp1 (bit 1,
++	 * same encoding as the GICC field) so the distributor forwards
++	 * Group 1 under either banking interpretation.
++	 */
++	writel_relaxed(GICD_ENABLE | GIC_CPU_CTRL_EnableGrp1,
++		       base + GIC_DIST_CTRL);
+ }
+ 
+ static int gic_cpu_init(struct gic_chip_data *gic)
+@@ -521,6 +545,25 @@
+ 	writel_relaxed(GICC_INT_PRI_THRESHOLD, base + GIC_CPU_PRIMASK);
+ 	gic_cpu_if_up(gic);
+ 
++	/*
++	 * hi3798mv310 bring-up aid: dump the banked SGI/PPI state exactly
++	 * as this CPU's non-secure view sees it, with offsets spelled out
++	 * so a serial log cannot be misread again.  Note the trap that
++	 * cost a full investigation day: GICD_ISENABLER0 is at dist+0x100
++	 * (0xf1001100); 0xf1001104 is GICD_ISENABLER1 (SPI 32-63) and
++	 * reads 0 after gic_dist_config() disables all SPIs, which is
++	 * normal and does NOT mean the SGIs are disabled.
++	 */
++	pr_info("MV310-GIC[%u]: GICD_CTLR(+0x000)=0x%08x GICD_TYPER(+0x004)=0x%08x IGROUPR0(+0x080)=0x%08x ISENABLER0(+0x100)=0x%08x ICFGR1(+0xc04)=0x%08x GICC_CTLR(+0x000)=0x%08x GICC_PMR(+0x004)=0x%08x\n",
++		cpu,
++		readl_relaxed(dist_base + GIC_DIST_CTRL),
++		readl_relaxed(dist_base + 0x004),
++		readl_relaxed(dist_base + GIC_DIST_IGROUP),
++		readl_relaxed(dist_base + GIC_DIST_ENABLE_SET),
++		readl_relaxed(dist_base + GIC_DIST_CONFIG + 0x4),
++		readl_relaxed(base + GIC_CPU_CTRL),
++		readl_relaxed(base + GIC_CPU_PRIMASK));
++
+ 	return 0;
+ }
+ 
