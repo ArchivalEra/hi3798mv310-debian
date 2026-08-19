@@ -273,3 +273,90 @@ Likely layers (in order of suspicion):
   (stage / go / go-boot / cmd)
 - Working logs: `/tmp/serial-live.log` (this round, full)
 - Notes (Chinese, not in this repo): `/mnt/hdd/hi3798mv310-stuff/notes/mv310-expert-handoff-08191236.md`
+
+---
+
+# Addendum 3 - 2026-08-19 expert review: the A4 finding is unproven (sleep confound), and three instrument corrections
+
+## B1. The "write SGIR -> hang" evidence is contaminated (A4 downgraded)
+
+The on-board script (`builds/initramfs/init`) ran `sleep 1` immediately
+after the STEP1 SGIR write. This kernel receives **zero interrupts for the
+whole boot** (MV310-IRQ = 0 always, no timer IRQ), and nanosleep wakeups
+are delivered by the arch-timer IRQ - which never arrives. So `sleep`
+never returns, the sequential script goes silent, and serial silence is
+indistinguishable from a real hang. The A4 conclusion "the system dies on
+SGI delivery" is therefore **unproven**; the only hard fact remains the
+old one: no interrupt is ever taken (0 MV310-IRQ lines).
+
+## B2. The MV310-IRQ probe is NOT at the first line of gic_handle_irq
+
+In `drivers/irqchip/irq-gic.c` the probe (`pr_info("MV310-IRQ: ...")`)
+sits **after** `readl_relaxed(cpu_base + GIC_CPU_INTACK)` - i.e. after
+the IAR read. "0 probe hits" therefore does not exonerate the GIC ACK
+path: a CPU that hangs on the IAR read would also produce zero hits.
+When the probe moves (see B4), a hit order of ENTER-print-then-nothing
+pinpoints the IAR read.
+
+## B3. Script bugs found and fixed
+
+- `builds/initramfs/init` read ISENABLER0 from 0xF1001104 again
+  (ISENABLER1) and SPENDSGIR0 from 0xF1000F20 (outside the GICD window;
+  real offset 0xF1001F20). Both fixed.
+- `scripts/mv310-gic-bisect.sh` defined CPENDSGIR at +0xf00 - that is
+  **GICD_SGIR** (CPENDSGIR0 is +0xf10), so the "best effort clear" line
+  was firing a self-SGI0: the exact hang trigger. Fixed. Also removed its
+  `sleep 2` (same confound as B1).
+
+## B4. Next boot: the no-sleep ladder (scripts/mv310-sgir-layer-bisect.sh, mirrored into builds/initramfs/init)
+
+After editing the initramfs, re-link the Image (`make Image`, the tree
+has CONFIG_INITRAMFS_SOURCE pointing at builds/initramfs) and re-stage.
+The ladder has no sleep; every step prints a marker before the risky
+action, so the last marker seen names the killing step:
+
+- E0 SGIR no-op write (empty target list)
+- E1 SGIR no-target (filter=01 all-but-self, CPUs 1-3 offline -> nobody
+  is delivered to). Dies -> the write stalls the bus. Lives -> only
+  delivery can kill.
+- E2a/E2b SGI0 priority 0xFF (above PMR 0xF0 -> held, not signalable),
+  then self-SGI0. SPENDSGIR0 bit0=1 must print (pend registered).
+- E2c restore priority -> signaling becomes legal at this write. Dies ->
+  delivery kills, registers and write mechanics innocent. Lives with
+  HPPIR=0x0 -> SGI0 pending AND signalable but never taken: fault is at
+  the CPU side (DAIF / vector routing / HCR_EL2).
+- E1b filter=10 self-only positive control; R verbatim replay of the
+  original STEP1 (R surviving retracts A4 fully).
+- S sleep sanity last: POST-SLEEP-LIVE would mean timer IRQs work and
+  the zero-interrupt premise itself must be re-examined.
+
+## B5. One-rebuild probe set (only if the ladder points at the CPU side / delivery kills)
+
+1. `gic_handle_irq`: add `pr_info("MV310-IRQ-ENTER cpu=%u", ...)` as the
+   true first statement, **before** the IAR read (keep the existing
+   after-IAR print renamed MV310-IRQ-IAR). Splits "died before the
+   handler" from "died on the IAR read".
+2. arm64 entry probes in `arch/arm64/kernel/entry-common.c` at
+   `el1_interrupt()` / the el0 IRQ path, before `handle_arch_irq`.
+3. One-shot sysreg dump (boot CPU, EL1-readable set): VBAR_EL1, DAIF,
+   CurrentEL, SCTLR_EL1.
+4. BL31: extend the existing SCR_EL3 print to also print **HCR_EL2 and
+   VBAR_EL2**. Rationale: sync exceptions provably work (syscalls from
+   devmem), while IRQ/FIQ routing is independently controlled by
+   HCR_EL2.TGE/IMO/FMO - and SCR_EL3 (0x238) is already clean, VBAR_EL1
+   is proven good by working syscalls. HCR_EL2 is the one routing
+   register nobody has looked at. If it is clean too, the remaining
+   suspects are the IAR read and mv310-specific GIC signaling.
+
+## B6. Re-reading of the v1 hang (mechanism correction)
+
+The v1 GICD_CTLR bit1 write **completed** - v1 kept booting after
+init_IRQ and died later at time_init. So "writing bit1 hangs instantly"
+is wrong as a mechanism. Two compatible readings: (a) the write enabled
+forwarding of an already-pending interrupt and the first-ever signaled
+IRQ killed the CPU (same kill zone the ladder tests), or (b) the write
+poisoned the GICD so the next GICD write (the arch-timer ISENABLER at
+time_init, the first GICD write after init_IRQ) stalled the bus. The
+revert stays correct either way; the errata wording should be softened
+from "writing it hangs" to "enabling it leads to a hang at the next
+interrupt-arming point".

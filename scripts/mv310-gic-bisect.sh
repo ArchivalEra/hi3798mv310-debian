@@ -20,7 +20,9 @@ CPU=0xf1002000
 ISEN0=$((DIST + 0x100))
 IGROUP=$((DIST + 0x80))
 SPENDSGIR=$((DIST + 0xf20))
-CPENDSGIR=$((DIST + 0xf00))
+# GICD_CPENDSGIR0 is at +0xf10. +0xf00 is GICD_SGIR: the old value made the
+# "best effort clear" line below fire a self-SGI0 - the exact hang trigger.
+CPENDSGIR=$((DIST + 0xf10))
 CTLR=$DIST
 GICC_CTLR=$CPU
 PMR=$((CPU + 0x4))
@@ -36,10 +38,12 @@ printf 'GICC_CTLR     (+0x000) = 0x%08x\n' "$(devmem $GICC_CTLR 32)"
 printf 'GICC_PMR      (+0x004) = 0x%08x\n' "$(devmem $PMR 32)"
 printf 'GICC_HPPIR    (+0x018) = 0x%08x\n' "$(devmem $HPPIR 32)"
 
+# No sleep anywhere: this kernel receives no timer IRQs, so any sleep would
+# block forever and fake a "hang". IRQ delivery is instantaneous against
+# instruction flow; sequential reads need no delay.
 echo "-- pend self SGI 8 (GICD_SPENDSGIR=0x100) --"
 devmem $SPENDSGIR 32 0x100
-sleep 2
-echo "-- after 2s --"
+echo "-- immediately after --"
 printf 'GICD_SPENDSGIR(+0xf20) = 0x%08x\n' "$(devmem $SPENDSGIR 32)"
 printf 'GICC_HPPIR    (+0x018) = 0x%08x\n' "$(devmem $HPPIR 32)"
 
