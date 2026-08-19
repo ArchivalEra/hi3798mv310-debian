@@ -360,3 +360,70 @@ time_init, the first GICD write after init_IRQ) stalled the bus. The
 revert stays correct either way; the errata wording should be softened
 from "writing it hangs" to "enabling it leads to a hang at the next
 interrupt-arming point".
+
+---
+
+# Addendum 4 (2026-08-19 22:58) - v3 ladder bench result: dies reading ISACTIVER0
+
+## 4.1. The three-piece set is unchanged (md5)
+
+| File | md5 |
+|---|---|
+| `/srv/tftp/mv310-l-loader-gicgrp1.bin` | `56283173` |
+| `/srv/tftp/mv310-Image-7.1.8-gicgrp1` | `59fa2b36` (v3 no-sleep ladder) |
+| `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `a1cec64c` |
+
+Full log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-ladder-v3-225410.log`
+
+## 4.2. Bench output (last line = death point)
+
+```
+[1.220898] === MV310-GIC-LADDER START (no-sleep revision) ===
+[1.232829] --- L0: kernel's own view ---
+[1.232829]   9: 0  GICv2  25 Level  vgic
+[1.232829]  11: 0  GICv2  30 Level  arch_timer     <- IRQ30 = SPI 30, NOT a PPI
+[1.232829]  12: 0  GICv2  27 Level  kvm guest vtimer
+[1.232829] IPI0-7: all 0                              <- IPIs never delivered
+[1.312431] --- L1: baseline registers (CPU0, NS view, fixed offsets) ---
+[1.321688] GICD_CTLR    (0xF1001000): 0x00000001
+[1.328891] GICC_CTLR    (0xF1002000): 0x000003E3
+[1.336018] GICC_PMR     (0xF1002004): 0x000000F0
+[1.343158] IGROUPR0     (0xF1001080): 0xFE00FFFF
+[1.350295] ISENABLER0   (0xF1001100): 0x4A00FFFF     <- last line, then dead
+[        ] ISACTIVER0   (0xF1001300): (never printed)
+```
+
+## 4.3. Reading (the ladder never got to run, but this is the most informative cell yet)
+
+The system died in the middle of a *pure register-read sequence* -
+after ISENABLER0(0x1100), before ISACTIVER0(0x1300) came out.
+
+1. **No SGIR write ever happened** (E0-MARKER not printed) -> the whole
+   "SGIR write hangs" branch is excluded. Death has nothing to do with writes.
+2. The dying access is **reading 0xF1001300 (ISACTIVER0)** -> a GIC
+   register read sequence faults/hangs at ISACTIVER0.
+3. The old devmem baseline (ec441e24) read 7 registers fine, but NEVER
+   read 0x1300. This script's new ISACTIVER0 read is the tripwire.
+
+## 4.4. Two hard side-facts
+
+- `ISENABLER0=0x4A00FFFF`: bit17 (PPI17 vtimer) + bit26 (PPI26) were
+  enabled later by drivers - the kernel IS enabling interrupts, SGI/PPI
+  enable state is live, not all-zero.
+- `arch_timer` is **SPI 30**, not a PPI (L0: irq 11 = GICv2 30 Level).
+  The main timer is an SPI despite the 4-PPI armv8-timer dts - worth
+  noting by itself.
+
+## 4.5. Questions for the expert
+
+1. **Is ISACTIVER0(0xF1001300) a landmine on this GIC variant?** Is the
+   NS read of that offset illegal/not-implemented on GIC-400 1S/1NS?
+   Does Hi3798's GIC omit the distributor ACTIVE registers?
+2. Suggestion: **skip ISACTIVER0 (0x1300) in the ladder**, L1 reads only
+   0x1000/0x2000/0x2004/0x1080/0x1100/0x1400/0x1f20/0x2018, go straight
+   into E0-E2-R-S. If the ladder completes after dropping 0x1300, that
+   proves 0x1300 is the kill zone.
+3. If reading 0x1300 triggers a recoverable sync fault (SIGBUS/SIGSEGV),
+   devmem would die silently on serial but the script would continue -
+   here the system is COMPLETELY still, which looks like a hang
+   (WFI/exception loop), not a one-shot recoverable fault.
