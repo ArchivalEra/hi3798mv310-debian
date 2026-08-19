@@ -169,3 +169,107 @@ MV310-GIC[1]: ... ISENABLER0(+0x100)=0x????????
   `/mnt/hdd/hi3798mv310-stuff/deploy/images/`.
 - The devmem Image has `maxcpus=1` in CONFIG_CMDLINE (CMDLINE_FORCE=y,
   U-Boot bootargs are ignored); change CONFIG_CMDLINE for maxcpus=4.
+
+---
+
+# Addendum 2026-08-19 12:36 - v2 bench results and the new hang-on-SGI finding
+
+> Authoritative status update for anyone taking this to the bench. The
+> v2 set is the current deployed one; the sections above still apply.
+
+## A1. v2 three-piece set (current, md5 verified)
+
+| File | md5 | Change vs v1 |
+|---|---|---|
+| `/srv/tftp/mv310-l-loader-gicgrp1.bin` | `56283173` | gicv2_main.c reverted to stock; only the SCR_EL3 print remains |
+| `/srv/tftp/mv310-Image-7.1.8-gicgrp1` | `e35b730b` | **GICD_CTLR write reverted to `GICD_ENABLE` only (0x1)**; GICC bit1 + IGROUP + MV310-GIC dump + MV310-IRQ probe kept |
+| `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `a1cec64c` | unchanged (has bl31 reserved-memory 0x02000000/0x40000) |
+
+## A2. v1 result (the reason for v2) - GICD_CTLR bit1 write hangs boot
+
+v1 Image `9673d8f5` wrote `GICD_ENABLE | EnableGrp1` in gic_dist_init()
+-> runtime GICD_CTLR = 0x3 -> **boot hung right after sched_clock**
+(t=0.000001, time_init section, no further output).
+
+Bisection (no rebuild, expert-designed): old l-loader `sgigrp1`
+(adb7459a, no BL31 patch 0002) + v1 Image -> still hung, GICD_CTLR
+still 0x3.  Conclusion: **the hang was caused by the kernel-side
+GICD_CTLR bit1 write itself**.  mv310's GICD_CTLR bit1 is NOT the
+standard GIC-400 NS read-only mirror bit - writing it (even to 1)
+hangs the boot.  This is now in the errata.
+
+## A3. v2 bench results - early hang gone, boot runs to initramfs
+
+```
+NOTICE:  MV310: SCR_EL3 = 0x238
+MV310-GIC[0]: GICD_CTLR(+0x000)=0x00000001 GICD_TYPER(+0x004)=0x0000fc65
+  IGROUPR0(+0x080)=0xfe00ffff ISENABLER0(+0x100)=0x0000ffff
+  ICFGR1(+0xc04)=0x55540000 GICC_CTLR(+0x000)=0x000003e3 GICC_PMR(+0x004)=0x000000f0
+[0.008626] Console: colour dummy device 80x25
+[0.075179] smp: Bringing up secondary CPUs ...
+[0.079777] smp: Brought up 1 node, 1 CPU
+[0.982983] Run /init as init process
+[1.018469] === MV310-DEVMEM-TEST START ===
+[1.031073] GICD_CTLR    (0xF1001000): 0x00000001
+[1.038230] GICC_CTLR    (0xF1002000): 0x000003E3
+[1.052527] ISENABLER0   (0xF1001104): 0x00000000   <- misread, ignore (see retraction)
+[1.071563] --- STEP1: self SGI0 to CPU0 (SGIR=0x10000) ---
+```
+
+Checklist against section 6:
+
+| Field | Expected | Bench | Verdict |
+|---|---|---|---|
+| SCR_EL3 bits[3:1] | 0 | 0x238 (bits1,2=0) | OK - no EL3 trap |
+| GICD_CTLR | 0x1 | 0x1 | OK - revert verified |
+| GICC_CTLR | 0x3e3 | 0x3e3 | OK - G0+G1 both on |
+| IGROUPR0 | 0xfe00ffff | 0xfe00ffff | OK - SGIs/PPIs in Group1 |
+| ISENABLER0 (0xf1001100!) | 0xffff | 0xffff | OK - **SGIs all enabled** |
+| MV310-IRQ lines | any | **0** | FAIL - delivery still broken |
+
+**Early hang is fully resolved. The system boots all the way into the
+initramfs devmem test.** The old "hang at sched_clock" is gone.
+
+## A4. NEW finding - writing SGIR hangs the system (was: "interrupt never arrives")
+
+The initramfs STEP1 did:
+
+```
+devmem 0xF1001F00 32 0x00010000    # write SGIR: self-SGI0 to CPU0
+```
+
+After that: the script's own "after SGI0" HPPIR/SPENDSGIR reads NEVER
+printed, the `MV310-IRQ` probe (first line of gic_handle_irq) fired
+**0 times**, and the system sat completely still (2+ min).
+
+Because the SGI is enabled (ISENABLER0=0xffff) and Group1 is open
+(GICC 0x3e3, GICD 0x1), **the system dies on/after SGI delivery rather
+than silently not delivering it**.  This retracts the earlier "SGI never
+reaches the CPU" story: the interrupt is pending, but the CPU dies
+*inside the delivery path*, before gic_handle_irq runs.
+
+Likely layers (in order of suspicion):
+1. exception vector / AArch64 trampoline (el1_irq -> ... -> gic_handle_irq)
+2. GIC ACK path (IAR read in the handler loop)
+3. SGI-trigger hardware behaviour on mv310 (GIC-400 with 1S/1NS quirks)
+
+## A5. What is needed next (for the expert)
+
+1. Judge which layer the "write SGIR -> hang" lives in. Candidate probe:
+   print at el1_irq entry (before gic_handle_irq), or check whether the
+   CPU is stuck in WFI/exception loop via a periodic CPU0 heartbeat.
+2. The initramfs bisect has STEP2-4 ready (flip GICD_CTLR=0x3, clear
+   FIQEn, IGROUP all-1, each re-sending SGI), but STEP1 must stop
+   hanging before they can run.
+3. Final acceptance unchanged: `MV310-IRQ` appears / `smp: Brought up
+   2 CPUs` (drop maxcpus=1) / /proc/interrupts SGI counters tick.
+
+## A6. Bench state (as of this addendum)
+
+- Board: hung in the devmem STEP1 (needs power-cycle to return to fastboot)
+- Serial proxy: `/mnt/hdd/hi3798mv310-stuff/scripts/serial-proxy.py`
+  (/tmp/ttybox + TCP 5555 ro / 5556 cmd / 5557 duplex)
+- Bench tooling: `/mnt/hdd/hi3798mv310-stuff/scripts/fb-run.py`
+  (stage / go / go-boot / cmd)
+- Working logs: `/tmp/serial-live.log` (this round, full)
+- Notes (Chinese, not in this repo): `/mnt/hdd/hi3798mv310-stuff/notes/mv310-expert-handoff-08191236.md`
