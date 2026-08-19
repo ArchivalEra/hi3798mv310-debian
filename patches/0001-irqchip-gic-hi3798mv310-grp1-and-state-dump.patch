@@ -1,90 +1,76 @@
 From: ArchivalEra <archivalera@localhost>
 Date: Wed, 19 Aug 2026 12:00:00 +0800
-Subject: [PATCH] irqchip/gic: hi3798mv310: keep Group 1 enabled and dump
- banked SGI/PPI state
+Subject: [PATCH v2] irqchip/gic: hi3798mv310: dump banked SGI/PPI state,
+ keep Group 1 enables except GICD_CTLR bit 1
 
-The hi3798mv310 board (poplar-derived hi3798mv2x TF-A, GIC-400,
-Cortex-A53 x4) deadlocks in SMP bringup because no GIC interrupt is
-ever delivered to any CPU.
+v2: the GICD_CTLR bit 1 (EnableGrp1) write is retracted.  Board bisect
+(2026-08-19, mv310, GIC-400): the only runtime difference between a
+booting image (GICD_CTLR=0x1, devmem baseline) and a hanging image
+(GICD_CTLR=0x3) is that bit.  The 0x3 image hangs in time_init()
+immediately after the sched_clock line, with no further serial output.
+The non-secure view of mv310's GICD_CTLR accepts bit 1 (unlike
+standard GIC-400 NS banking where bit 0 is the EnableGrp1NS alias) and
+enabling it wedges the boot.  The write is dropped; GICD_CTLR stays at
+the known-good 0x1.
 
-Runtime non-secure reads of the fully-initialized kernel show a GIC
-that looks correctly enabled (GICD_CTLR=0x1 in the NS view, IGROUPR0
-with SGIs and timer PPIs in Group 1, GICC_CTLR=0x3e3), so the two
-"findings" that motivated the previous fix attempts are retracted:
+What remains in this patch:
 
- 1. "ISENABLER0 == 0 (SGIs never enabled)" was read from 0xf1001104,
-    which is GICD_ISENABLER1 (SPI 32-63).  That register reads 0 after
-    gic_dist_config() disables all SPIs - that is normal.  The real
-    GICD_ISENABLER0 is at dist+0x100 = 0xf1001100 and is written with
-    0xffff (GICD_INT_EN_SET_SGI) by gic_cpu_config() on every CPU.
-
- 2. "GICD_CTLR == 0x1 means the kernel cleared EnableGrp1" is a
-    banked-view misread: in the non-secure view of GICD_CTLR, bit 0 is
-    the alias of EnableGrp1(NS), so 0x1 is the *good* state.
-
-Since the reference board (hi3798mv300) runs four cores, arch timer
-PPIs and SGIs with the same TF-A platform and an unmodified mainline
-kernel, none of the Group/enable theory explains the failure by
-itself.  This patch therefore:
-
- - keeps the already-validated harmless belt-and-braces writes
-   (GICC_CTLR.EnableGrp1, GICD_CTLR bit 1, IGROUPR0 = all Group 1), and
-
- - adds a one-shot per-CPU dump of the banked SGI/PPI state with the
-   register offsets spelled out in the message itself, so the next
-   serial log cannot be misread the same way.
-
-The decisive next experiments (software-pended PPI/SGI bisection from
-the initramfs) are documented in docs/mv310-gic-bisect-runbook.md.
+ - gic_cpu_if_up(): also set GICC_CTLR.EnableGrp1 (bit 1).  Validated
+   on the grp1fix image (log gicc_ctlr=0x3e3); does not change boot.
+ - gic_dist_init(): write GICD_IGROUPR0 = 0xffffffff (SGIs/PPIs ->
+   Group 1).  Harmless on GIC-400, the relevant bits already read 1.
+ - gic_cpu_init(): one-shot per-CPU dump of the banked SGI/PPI state
+   (GICD_CTLR/TYPER/IGROUPR0/ISENABLER0/ICFGR1/GICC_CTLR/GICC_PMR)
+   with register offsets spelled out in the message itself, so the
+   next serial log cannot be misread the way "ISENABLER0 == 0" was
+   (that read was at 0xf1001104 = GICD_ISENABLER1, SPI 32-63; the
+   real ISENABLER0 is at 0xf1001100 and is 0xffff at runtime).
 ---
- drivers/irqchip/irq-gic.c | 53 ++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 52 insertions(+), 1 deletion(-)
+ drivers/irqchip/irq-gic.c | 66 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 65 insertions(+), 1 deletion(-)
 
 --- a/drivers/irqchip/irq-gic.c
 +++ b/drivers/irqchip/irq-gic.c
-@@ -457,7 +457,15 @@
+@@ -457,7 +457,13 @@
  	bypass = readl(cpu_base + GIC_CPU_CTRL);
  	bypass &= GICC_DIS_BYPASS_MASK;
  
 -	writel_relaxed(bypass | mode | GICC_ENABLE, cpu_base + GIC_CPU_CTRL);
 +	/*
-+	 * hi3798mv310: also set GICC_CTLR.EnableGrp1 (bit 1). The
-+	 * poplar-derived BL31 only programs the secure view of the CPU
-+	 * interface; in some banked configurations bit 1 is what gates
-+	 * Group 1 delivery. For a plain non-secure GIC-400 view bit 0 is
-+	 * already the EnableGrp1(NS) alias, so this is harmless.
++	 * hi3798mv310: also set GICC_CTLR.EnableGrp1 (bit 1). This was
++	 * validated on the grp1fix image (log: gicc_ctlr=0x3e3) and does
++	 * not change boot behavior.
 +	 */
 +	writel_relaxed(bypass | mode | GICC_ENABLE |
 +		       GIC_CPU_CTRL_EnableGrp1, cpu_base + GIC_CPU_CTRL);
  }
  
  
-@@ -481,7 +489,23 @@
+@@ -481,6 +487,23 @@
  
  	gic_dist_config(base, gic_irqs, GICD_INT_DEF_PRI);
  
--	writel_relaxed(GICD_ENABLE, base + GIC_DIST_CTRL);
 +	/*
 +	 * hi3798mv310: force SGI/PPI (INTID 0-31) into Group 1 in the
-+	 * non-secure banked view. The poplar-derived BL31 only programs
-+	 * the secure bank through gicv2_secure_ppi_sgi_setup_props();
-+	 * whether the NS alias needs this write varies, but it is
-+	 * harmless on GIC-400.
++	 * non-secure banked view.  Harmless on GIC-400 (the relevant bits
++	 * already read 1 on this board).
 +	 */
 +	writel_relaxed(0xffffffff, base + GIC_DIST_IGROUP);
 +
 +	/*
-+	 * GICD_ENABLE is bit 0; in the non-secure view that bit is the
-+	 * alias of EnableGrp1(NS). Also set GICD_CTLR.EnableGrp1 (bit 1,
-+	 * same encoding as the GICC field) so the distributor forwards
-+	 * Group 1 under either banking interpretation.
++	 * NOTE: do NOT write GICD_CTLR bit 1 (EnableGrp1) from the kernel
++	 * on this board.  Bisect (2026-08-19): the only runtime difference
++	 * between a booting and a hanging image is GICD_CTLR 0x1 -> 0x3,
++	 * and the 0x3 image hangs in time_init() right after sched_clock.
++	 * The non-secure view of mv310's GICD_CTLR accepts bit 1 (non
++	 * standard for GIC-400 NS banking, where bit 0 is the EnableGrp1NS
++	 * alias) and enabling it wedges the boot.  Keep the plain
++	 * GICD_ENABLE write (0x1) which is the known-good value.
 +	 */
-+	writel_relaxed(GICD_ENABLE | GIC_CPU_CTRL_EnableGrp1,
-+		       base + GIC_DIST_CTRL);
+ 	writel_relaxed(GICD_ENABLE, base + GIC_DIST_CTRL);
  }
  
- static int gic_cpu_init(struct gic_chip_data *gic)
-@@ -521,6 +545,25 @@
+@@ -521,6 +544,23 @@
  	writel_relaxed(GICC_INT_PRI_THRESHOLD, base + GIC_CPU_PRIMASK);
  	gic_cpu_if_up(gic);
  
@@ -93,9 +79,7 @@ the initramfs) are documented in docs/mv310-gic-bisect-runbook.md.
 +	 * as this CPU's non-secure view sees it, with offsets spelled out
 +	 * so a serial log cannot be misread again.  Note the trap that
 +	 * cost a full investigation day: GICD_ISENABLER0 is at dist+0x100
-+	 * (0xf1001100); 0xf1001104 is GICD_ISENABLER1 (SPI 32-63) and
-+	 * reads 0 after gic_dist_config() disables all SPIs, which is
-+	 * normal and does NOT mean the SGIs are disabled.
++	 * (0xf1001100); 0xf1001104 is GICD_ISENABLER1 (SPI 32-63).
 +	 */
 +	pr_info("MV310-GIC[%u]: GICD_CTLR(+0x000)=0x%08x GICD_TYPER(+0x004)=0x%08x IGROUPR0(+0x080)=0x%08x ISENABLER0(+0x100)=0x%08x ICFGR1(+0xc04)=0x%08x GICC_CTLR(+0x000)=0x%08x GICC_PMR(+0x004)=0x%08x\n",
 +		cpu,

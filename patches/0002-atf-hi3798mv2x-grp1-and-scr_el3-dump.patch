@@ -1,74 +1,37 @@
 From: ArchivalEra <archivalera@localhost>
 Date: Wed, 19 Aug 2026 12:00:00 +0800
-Subject: [PATCH] hi3798mv2x: enable Group 1 GIC forwarding and print
- SCR_EL3 at BL31 setup
+Subject: [PATCH v2] hi3798mv2x: print SCR_EL3 at BL31 setup only
 
-hi3798mv310 (poplar-derived hi3798mv2x TF-A, GIC-400, Cortex-A53 x4)
-deadlocks in SMP bringup: no GIC interrupt is delivered to any CPU
-even though the kernel-side configuration reads back correct.
+v2: the gicv2_distif_init() EnableGrp1 (GICD_CTLR bit 1) change is
+retracted.  Board bisect on mv310 shows the kernel-side equivalent
+write hangs the boot (GICD_CTLR 0x1 -> 0x3, hang in time_init), and
+mv310's non-secure view of GICD_CTLR accepts bit 1 non-standardly.
+The same write from EL3 is neither needed nor safe to test, so this
+patch now only adds the SCR_EL3 diagnostic.
 
-The reference board (hi3798mv300) boots four cores with this same
-TF-A platform and an unmodified mainline kernel, so nothing in this
-platform code is broken per se.  The changes here are therefore
-belt-and-braces plus one diagnostic:
-
- - gicv2_distif_init() now also sets GICD_CTLR.EnableGrp1 (bit 1) from
-   EL3.  The Linux kernel later rewrites GICD_CTLR through its
-   non-secure alias (bit 0 only), and one open banking interpretation
-   is that the EnableGrp1 state machine sits in "secure only" (1S)
-   until the secure side has set the bit once.  Writing it here is
-   harmless where the NS alias alone would suffice (mv300 works with
-   or without it).
-
- - bl31_platform_setup() prints SCR_EL3.  SCR_EL3.IRQ/FIQ/EA decide
-   whether IRQs and FIQs from EL1/EL2 trap to EL3; if any is set, the
-   kernel never sees an interrupt even though the GIC signals it.  This
-   is the last major unchecked suspect for the "pending at GIC, never
-   taken" symptom and a single serial line closes it.
-
-Build-tested with the platform's normal make invocation
-(PLAT=hi3798mv2x, SPD=none, POPLAR_RECOVERY=1).
+bl31_platform_setup() prints SCR_EL3.  SCR_EL3.IRQ/FIQ/EA (bits
+[3:1]) decide whether IRQs and FIQs from EL1/EL2 trap to EL3; if any
+is set, the kernel never sees an interrupt even though the GIC
+signals it.  This is the last major unchecked suspect for the
+"pending at GIC, never taken" symptom on hi3798mv310, and a single
+serial line closes it.
 ---
- drivers/arm/gic/v2/gicv2_main.c                 | 13 +++++++++++--
- plat/hisilicon/hi3798mv2x/bl31_plat_setup.c     | 12 ++++++++++++
- 2 files changed, 23 insertions(+), 2 deletions(-)
+ plat/hisilicon/hi3798mv2x/bl31_plat_setup.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
 
---- a/drivers/arm/gic/v2/gicv2_main.c
-+++ b/drivers/arm/gic/v2/gicv2_main.c
-@@ -118,8 +118,19 @@
- 			driver_data->interrupt_props_num);
- 
- 
--	/* Re-enable the secure SPIs now that they have been configured */
--	gicd_write_ctlr(driver_data->gicd_base, ctlr | CTLR_ENABLE_G0_BIT);
-+	/*
-+	 * Re-enable the secure SPIs now that they have been configured.
-+	 * Also enable Group 1 forwarding: the non-secure Linux kernel
-+	 * (SGI IPIs, arch timer PPIs are Group 1) rewrites GICD_CTLR from
-+	 * the non-secure alias early in boot, but some banked banking
-+	 * interpretations leave the EnableGrp1 state machine in "secure
-+	 * only" (1S) until the secure side has written the bit once.
-+	 * Writing it here from EL3 keeps it harmless on platforms where
-+	 * the NS alias alone would be sufficient (hi3798mv300 works
-+	 * without this, hi3798mv310 does not).
-+	 */
-+	gicd_write_ctlr(driver_data->gicd_base,
-+			ctlr | CTLR_ENABLE_G0_BIT | CTLR_ENABLE_G1_BIT);
- }
- 
- /*******************************************************************************
 --- a/plat/hisilicon/hi3798mv2x/bl31_plat_setup.c
 +++ b/plat/hisilicon/hi3798mv2x/bl31_plat_setup.c
-@@ -112,6 +112,16 @@
+@@ -112,6 +112,17 @@
  	poplar_gic_driver_init();
  	poplar_gic_init();
  
 +	/*
 +	 * hi3798mv310 bring-up aid: SCR_EL3 decides whether IRQs/FIQs
-+	 * from EL1/EL2 trap to EL3 instead of the kernel.  One of the
-+	 * last unchecked suspects for "interrupts pending at the GIC but
-+	 * never taken by the CPU".  Bits: [0]=NS [1]=IRQ [2]=FIQ [3]=EA,
-+	 * [10]=RW.  IRQ/FIQ/EA must all read 0 for a normal hand-off.
++	 * from EL1/EL2 trap to EL3 instead of the kernel.  Bits: [0]=NS
++	 * [1]=IRQ [2]=FIQ [3]=EA, [10]=RW.  IRQ/FIQ/EA must all read 0
++	 * for a normal hand-off.  (gicv2_distif_init is intentionally
++	 * left unmodified: the kernel-side GICD_CTLR bit1 experiment
++	 * hangs on mv310, and the same write from EL3 is not needed.)
 +	 */
 +	NOTICE("MV310: SCR_EL3 = 0x%llx\n",
 +	       (unsigned long long)read_scr_el3());

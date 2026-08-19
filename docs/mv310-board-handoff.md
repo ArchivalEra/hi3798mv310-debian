@@ -21,12 +21,12 @@ problem - it is a "find where the delivery path breaks" problem.
 
 | File | md5 | Role |
 |---|---|---|
-| `/srv/tftp/mv310-l-loader-gicgrp1.bin` | `f8cf9a38` | l-loader + BL31 with patch 0002 |
+| `/srv/tftp/mv310-l-loader-gicgrp1.bin` | `56283173` | l-loader + BL31 with patch 0002 |
 | `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `a1cec64c` | unchanged dtb (4-PPI armv8-timer) |
-| `/srv/tftp/mv310-Image-7.1.8-gicgrp1` | `9673d8f5` | kernel with patch 0001 (CONFIG_CMDLINE has maxcpus=1) |
+| `/srv/tftp/mv310-Image-7.1.8-gicgrp1` | `e35b730b` | kernel with patch 0001 (CONFIG_CMDLINE has maxcpus=1) |
 
 Archives in `/mnt/hdd/hi3798mv310-stuff/deploy/images/`:
-`Image-7.1.8-gicgrp1-dump-9673d8f5`, `l-loader-mv310-gicgrp1-f8cf9a38.bin`.
+`Image-7.1.8-gicgrp1-v2-e35b730b`, `l-loader-mv310-gicgrp1-56283173.bin`.
 
 Boot sequence:
 
