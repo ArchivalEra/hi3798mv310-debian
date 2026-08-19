@@ -427,3 +427,73 @@ after ISENABLER0(0x1100), before ISACTIVER0(0x1300) came out.
    devmem would die silently on serial but the script would continue -
    here the system is COMPLETELY still, which looks like a hang
    (WFI/exception loop), not a one-shot recoverable fault.
+
+---
+
+# Addendum 5 (2026-08-20) - v4 minimal isolation result: dies right after reading ISENABLER0 (AUTHORITATIVE)
+
+## 5.1. The v4 experiment (per expert review, all confounds removed)
+
+- Image `646e8684` (v4): initramfs rewritten - **ISACTIVER0 (0x1300) skipped entirely**,
+  no `sleep`, no `$(devmem)` command substitution, no `set -e`, and **every MMIO access
+  bracketed by `X-BEFORE` / `X-AFTER rc=$?`**.
+- Only 7 registers touched: GICD_CTLR(0x1000), IGROUPR0(0x1080), ISENABLER0(0x1100),
+  GICC_CTLR(0x2000), GICC_PMR(0x2004), GICC_HPPIR(0x2018), SGIR(0x1F00).
+- l-loader `56283173`, dtb `a1cec64c` unchanged. Bench flow fixed: `go` then let autoboot
+  boot the staged set (no second `go`, no Synchronous Abort).
+- Full log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v4-minimal-011120.log`
+
+## 5.2. Bench output (last line = death point)
+
+```
+[1.221318] === MV310-GIC-MINIMAL START (v4, no 0x1300, no sleep, no $()) ===
+[1.228574] --- L1: baseline reads (each bracketed) ---
+[1.233870] R-GICD_CTLR-BEFORE
+[1.238760] 0x00000001
+[1.241627] R-GICD_CTLR-AFTER rc=0          <- read OK
+[1.245100] R-IGROUPR0-BEFORE
+[1.249905] 0xFE00FFFF
+[1.252773] R-IGROUPR0-AFTER rc=0          <- read OK
+[1.256160] R-ISENABLER0-BEFORE
+[1.261130] 0x4A00FFFF                     <- devmem read RETURNED the value
+        (R-ISENABLER0-AFTER rc=$? never printed)
+```
+
+## 5.3. Reading (the whole story in one cell)
+
+1. **0x1300 is exonerated**: v4 never reads ISACTIVER0 yet dies at the same relative
+   point. The v3 "dies reading ISACTIVER0" was a red herring.
+2. **Death is instruction-level**: `devmem 0xF1001100` read SUCCEEDED (0x4A00FFFF
+   printed) but the next shell `echo AFTER` never ran - the system dies between
+   devmem process exit and shell resumption.
+3. GICD_CTLR and IGROUPR0 reads are both fine (BEFORE + value + AFTER rc=0).
+   Only the ISENABLER0 read is followed by death.
+4. **Most likely mechanism**: reading ISENABLER0 (which has PPI17 vtimer + PPI26
+   enabled) samples/strobes the GIC's pending PPI state; when the devmem syscall
+   returns and IRQs are re-enabled, a pending interrupt is taken and the CPU dies
+   in the exception entry path - before gic_handle_irq (hence the zero MV310-IRQ
+   lines every boot).
+
+This narrows the field decisively: **interrupts can pend and signal to the CPU,
+but the CPU dies taking the interrupt**. Suspect: AArch64 exception vector /
+trampoline, or the GIC ACK (IAR read) path.
+
+## 5.4. Next probes (in order)
+
+1. Kernel: add `MV310-IRQ-ENTER` as the TRUE first line of gic_handle_irq (before the
+   IAR read); rename the existing print `MV310-IRQ-IAR`. ENTER printed + IAR not ->
+   dies in IAR read. ENTER not printed -> dies even earlier (vector/trampoline).
+2. `arch/arm64/kernel/entry-common.c` el1_interrupt() entry print; one-shot sysreg
+   dump (VBAR_EL1, DAIF, CurrentEL, SCTLR_EL1).
+3. BL31: print HCR_EL2 and VBAR_EL2 next to the existing SCR_EL3 print. Sync
+   exceptions work (devmem syscalls fine), VBAR_EL1 fine, SCR_EL3 clean (0x238,
+   bits 1-2 = 0) - **HCR_EL2.TGE/IMO/FMO is the only untested routing register**.
+4. Acceptance unchanged: `MV310-IRQ` appears / `smp: Brought up 2 CPUs` (drop
+   maxcpus=1) / /proc/interrupts SGI counters tick.
+
+## 5.5. Bench state
+
+- Board: hung right after the ISENABLER0 read (power-cycle to fastboot to rerun).
+- Current Image `646e8684` is the v4 minimal-isolation build, already deployed.
+- ccache now baked into `kernel/build-mv310-718.sh` (`CC="ccache clang"`,
+  `CCACHE_DIR=$BASE/.ccache`).
