@@ -649,3 +649,196 @@ Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v5-icfgr0-123155.log`
   H-VEC vs H-GATE vs H-SRC can be decided in a single boot.
 - Or rely on the kernel-side HPPIR + GICMAP values, which are not
   subject to the userspace devmem exception path.
+
+---
+
+# Addendum 8 (2026-08-20 evening) — expert re-analysis: three corrections, one unified suspect (T1), one discriminating build
+
+> Full review of `serial-v5-icfgr0-123155.log` (BOTH boots), the v3/v4/031546
+> logs, `builds/initramfs/init`, `arch/arm64/kernel/smp.c`, `irq-gic.c`,
+> `irq-gic-common.c`, TF-A `runtime_exceptions.S`/`psci_on.c`/`plat_pm.c`,
+> and the kernel .config. No new boot was needed for any of this.
+
+## 8.1 New facts mined from existing data
+
+1. **The v5b log contains TWO boots; boot #1 (v5, maxcpus lost) is the most
+   informative cell of the whole investigation.** After "MV310-CPUON state
+   validated rc=0", the garbled line de-interleaves (tail is clean:
+   `=1 gicc_ctlr=0x1e9 pmr=0xf8`) into: BL31's psci_on tail
+   ("MV310-CPUON unlocked+returning rc=0", fragments "N-unlo ked f i eturn
+   anger") concurrent with kernel CPU1 prints. The clean tail is the ending of
+   `MV310-GICMAP-EARLY: cpu_init entry cpu=1 gicc_ctlr=0x1e9 pmr=0xf8`.
+   **CPU1 booted into the kernel and reached gic_cpu_init.** The garble itself
+   is benign: BL31 printf and kernel printk share no lock; two masters on the
+   PL011 interleave and drop bytes.
+2. **CPU1's death zone is now bounded to one function.** In
+   `secondary_start_kernel` (arch/arm64/kernel/smp.c), `notify_cpu_starting()`
+   (line 243, which runs the cpuhp callback → gic_cpu_init) comes BEFORE the
+   "CPU%u: Booted secondary processor" print (line 252). A1(cpu=1) printed,
+   "Booted secondary processor" never did ⇒ CPU1 died/wedged INSIDE
+   gic_cpu_init, between the GICMAP-EARLY print and the GICMAP print. The MMIO
+   in that window (all executed fine by CPU0 at [0.000000]; only the CPU1
+   banked register file differs):
+   - `gic_get_cpumask`: ITARGETSR0-7 reads (0xF1001800..0xF100181C)
+   - `gic_cpu_config` (irq-gic-common.c:121): writes 0xffffffff to
+     ICACTIVER0 (0xF1001380) and ICENABLER0 (0xF1001180), then IPRIORITYR0-7
+     writes (0xF1001400..0xF100141C)
+   - GICC_PMR write (0xF1002004); `gic_cpu_if_up`: GICC_CTLR read, GICC_IDENT
+     read (0xF10020FC), 4× GICC_APRIO writes (0xF1002100+) if ident matches,
+     GICC_CTLR read+write.
+3. **The SMP hang can never self-report.** CPU0's wait is
+   `wait_for_completion_timeout(&cpu_running, msecs_to_jiffies(5000))`
+   (smp.c:135). The timeout needs a timer IRQ; timer IRQs never fire ⇒ the
+   5s timeout never expires ⇒ `CPU1: failed to come online` can NEVER print.
+   CPU0 sleeps forever. Frozen jiffies also mean EVERY
+   wait_for_completion_timeout in this kernel is forever — this is the same
+   reason `sleep` never returns (B1) and no hang can ever time out.
+4. **No CPU is sitting in an unhandled EL3 trap.** TF-A wires
+   `report_unhandled_exception` / `report_unhandled_interrupt` to all EL3
+   vectors (bl31/aarch64/runtime_exceptions.S:266-306) and the BL31 console
+   demonstrably works at t=0.075s. No EL3 dump ever appeared after any
+   "death" ⇒ the "SCR_EL3.EA=1 silently swallows an async abort into EL3"
+   family is refuted.
+5. **earlycon is the ONLY console — forever.** There is no
+   "console [ttyAMA0] enabled" line anywhere; uart-pl011 never probed (clock
+   lookup, likely). Kernel printk, userspace echo AND devmem's value print
+   all go through the single earlycon pl011@0xf8b00000 poll path (the init
+   script does `exec 1>/dev/kmsg`, so script output is vprintk → console →
+   same UART). A wedge anywhere in this one path silences everything, and
+   there is no RX path either (serial input can never be an aliveness check).
+6. **Aliveness after every "death" was never tested.** B1's own retraction
+   logic ("serial silence is indistinguishable from a hang") applies equally
+   to v3/v4/v5b: the box may have been alive-but-wedged (or alive with a
+   wedged console) in all three. The init script even ends with
+   `while :; do :; done` — an alive-forever PID1.
+7. **031546 is a counterexample to "userspace GICD reads kill".** It survived
+   SIX userspace reads (0x1000, 0x2000, 0x1080, 0x1104, 0x2014, 0x2018 —
+   each bracket-printed) and only went silent after the SGIR WRITE + sleep.
+   EL0-fatal set so far: {0x1100 read ×2, 0x1C00 read ×1}. EL0-safe set:
+   {0x1000, 0x1080, 0x1104, 0x1200, all GICC}. And the asymmetry: **kernel
+   EL1 reads 0xF1001100 fine at every boot** (GICMAP probe prints
+   isenabler0) — same register, same instruction class, different privilege.
+
+## 8.2 Three corrections to the v5b reading (§7.3 items 2-3 are retracted)
+
+1. **"取中断即死" (die on interrupt take) is NOT supported by v5b's own
+   data.** At 1.142s ISPENDR0=0x00000000 — nothing pending (no SGI, no PPI;
+   no SPIs enabled), so in the ICFGR0→echo window there was nothing legal to
+   deliver. MV310-IRQ-ENTER — the TRUE first statement of gic_handle_irq,
+   before the IAR read, deployed in the v5b Image — fired 0 times in both
+   boots. An interrupt that never pends cannot be taken; one delivered late
+   in the window would have printed ENTER first. The "devmem sampling → IRQ
+   re-enable → take → die" chain must be withdrawn as the v5b mechanism.
+2. **The kill is not offset-specific in any architectural sense.** Fatal
+   reads moved 0x1300 (v3, already retracted) → 0x1100 (v4) → 0x1C00 (v5b),
+   and 031546 survived six reads off the same page. What IS consistent:
+   output stops within ~0-10ms after certain EL0 GICD transactions, at a
+   varying instruction, zero bytes after, no oops, no EL3 dump.
+3. **H-GATE is refuted as the timer explanation.** ISPENDR0=0 +
+   GICC_HPPIR=0x3FF (031546) + arch_timer count=0 after >1s at HZ=250 means
+   PPI30 never asserted at all — nothing pending to gate. A gate would show
+   "pending but not signaled" (ISPENDR0 bit30=1, HPPIR=0x3FF). H-SRC (the
+   cp15 timer PPI line never asserts; the vendor kernel used MMIO timers on
+   SPIs 58/91/59/92) is now the leading root cause for the zero-timer-IRQ
+   symptom, and frozen jiffies follow from it.
+
+## 8.3 Unified suspect T1: the GICD slave port (or its bus/firewall) wedges on specific transactions
+
+- v1: kernel EL1 write GICD_CTLR=0x3 — write completes (boot continued past
+  init_IRQ), then the NEXT GICD transaction (arch timer ISENABLER write at
+  time_init) never completes → silent hang at time_init. This is B6 reading
+  (b), now with a mechanism.
+- v3/v4/v5b: EL0 read of 0x1100/0x1C00 completes (value printed) but
+  asynchronously poisons the fabric; the next uncacheable peripheral access —
+  the UART FR poll of the next console write — blocks forever. On Cortex-A53,
+  Device-memory loads are strongly ordered: one stalled outstanding device
+  load blocks subsequent device accesses on that CPU. Result: total silence,
+  no exception, no EL3 dump.
+- 031546's post-SGIR silence: either `sleep` (B1) or the EL0 SGIR WRITE
+  wedging — indistinguishable retroactively; E2 re-tests. A4's status goes
+  from "retracted" back to "undetermined".
+- boot #1: CPU1's banked sequence above (or TF-A's gicv2_pcpu_distif_init
+  writes moments earlier — see 8.4 step 4) wedges CPU1; CPU0 sleeps eternally
+  on a timeout that can never expire.
+- The EL0-vs-EL1 asymmetry on 0xF1001100 points at a HiSilicon
+  bus/firewall behavior keyed on AXI protection bits (unprivileged/NS),
+  i.e. NOT interrupt logic at all.
+- T1 requires no interrupt to be delivered anywhere; it is compatible with
+  all observations including zero ENTER hits and zero pending interrupts.
+
+Demoted but alive:
+- T2 — console/printk-only software wedge, box alive (console_lock held
+  forever / earlycon stuck). E1's raw heartbeat discriminates: H's continue
+  while printk stops ⇒ T2.
+- H-VEC — "first IRQ kills before gic_handle_irq". Demoted (nothing pending;
+  pre-IAR ENTER never hit). Remains testable by E2's SGIR step.
+- H-GATE — refuted for PPIs/timer; only meaningful for SGI forwarding until
+  the SGIR test actually runs.
+
+## 8.4 The discriminating build (one kernel rebuild + one script rewrite)
+
+E1 "flight recorder" (kernel, additive only):
+1. **Raw-UART heartbeat**: SCHED_FIFO(1) kthread pinned CPU0, pure busy loop
+   (never sleeps — no timers exist), every ~200ms (calibrate on cntvct) poll
+   FR at ioremap(0xf8b00000)+0x18 until TXFF (bit5) clears, then write 'H'
+   to DR (+0x00). NO printk involvement — bypasses every lock in the system.
+   RT-throttling yields ~50ms/s to the shell: enough. Every Nth beat may
+   additionally pr_info("HB") and kernel-read GICC_HPPIR to compare raw vs
+   printk health.
+2. **gic_cpu_init step markers** (secondary path): one printk before each
+   MMIO group: [CI-1] cpumask read, [CI-2] clear writes, [CI-3] pri writes,
+   [CI-4] pmr write, [CI-5] ident read, [CI-6] ctlr write, [CI-7] done.
+   Localizes boot #1's CPU1 death to instruction granularity.
+3. Keep ENTER/IAR probes. Optional: el1_interrupt()/el0 IRQ entry one-shot
+   print in entry-common.c (vector→handler gap); add ISR_EL1 to MV310-SYSREG.
+
+E2 "zero-read" init script (same rebuild):
+1. FIRST action, before ANY other userspace GICD/GICC access: the SGIR
+   self-test — P-BEFORE; `devmem 0xF1001F00 32 0x02000008`; echo P-AFTER
+   rc=$?; `dmesg | grep -c MV310-IRQ`; `cat /proc/interrupts`. If the SGI8
+   counter increments and ENTER prints ⇒ GIC delivery AND the vector path
+   WORK ⇒ the "delivery is lethal" story collapses and the remaining work
+   is the timer port.
+2. Then read ISPENDR0 (0x1200, safe) + GICC_HPPIR (0x2018, safe): did SGI8
+   pend / reach the interface?
+3. LAST: re-challenge one fatal read (`devmem 0xF1001100` or 0xF1001C00)
+   with the heartbeat running. Outcome table:
+   - H's continue, printk continues, read survives ⇒ the "read kills"
+     pattern was coincidence — re-examine from scratch.
+   - H's continue, printk stops ⇒ T2 (console/printk software wedge; box
+     alive) — dig console_lock/earlycon.
+   - H's stop instantly ⇒ T1 (CPU0/fabric wedge) — and combined with E1.2,
+     boot #1 localizes too.
+4. Zero-code datapoint for the next maxcpus=4 boot: check whether BL31's
+   `MV310-GIC: on_finish after cpu=1 ...` appears. Present ⇒ TF-A's banked
+   writes on CPU1 completed, wedge is in the kernel sequence. Absent (only
+   the pre-init "on_finish cpu=1") ⇒ the wedge is in TF-A's own
+   gicv2_pcpu_distif_init on CPU1 (feeds H2/E5).
+
+E3 If E2 shows SGI delivery works: the real blocker is H-SRC. Port the
+   vendor MMIO timer (timer@0xf8a29000, clockevents on SPIs 58/91/59/92) as
+   clockevent; keep the cp15 counter as clocksource. Jiffies live ⇒ timeouts
+   live ⇒ SMP bringup can self-report, sleep works, RCU advances.
+
+E4 CONFIG_KVM=n control build (A6.6 step 3) — keep separate from E1.
+
+E5 If E1.2 pins CPU1's death to a specific op: test the H2 fix — BL31
+   gicv2_pcpu_distif_init skipping the banked ICENABLER nuke (or skipping
+   pcpu_distif_init entirely) — one-boot test.
+
+## 8.5 Handoff corrections and new discipline entries
+
+- Retract §7.3 items 2-3 (the "devmem sampling → IRQ re-enable window"
+  mechanism) and 8's "判读" accordingly.
+- A4/B1: post-SGIR silence in 031546 is "undetermined", not "sleep confound"
+  — under T1 the EL0 SGIR write itself is a wedge candidate.
+- New discipline entries:
+  1. EL0 devmem access and EL1 kernel access to the same GICD offset are NOT
+     equivalent — never cross-apply safety conclusions.
+  2. earlycon is the only console and has no RX path; serial input can never
+     be an aliveness check; the only aliveness channel is a raw-UART (or
+     GPIO) heartbeat.
+  3. Every wait_for_completion_timeout in this kernel is FOREVER until the
+     timer is fixed — no hang can time out or self-report.
+  4. "Serial silence" proves nothing about life or death — always run a
+     heartbeat before interpreting silence.
