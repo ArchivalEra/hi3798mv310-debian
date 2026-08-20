@@ -58,10 +58,12 @@ Fields: `ID | location | fires | reading (what it proves) | status | retire when
 | Offset | Register | Why |
 |---|---|---|
 | `0xF1001100` | ISENABLER0 | historically fatal from EL0 (v3/v4); safe from EL1 (GICMAP probe) |
+| `0xF1001080` | IGROUPR0   | fatal from EL0 (v6: read 0x1080 -> never returned, 75544B log); safe from EL1 (GICMAP probe: IGROUPR0=0xFE00FFFF on every boot) |
+| `0xF1001104` | ISENABLER1 | fatal from EL0 (v6b: read 0x1104 -> never returned); never needed in init script (old value 0x00000000 is noise) |
 | `0xF1001C00` | ICFGR0 | historically fatal from EL0 (v5b) |
 | `0xF1001300` | ISACTIVER0 | v3 death site (later retracted, still off-limits) |
 
-EL0-safe set (proven, 031546): `0xF1001000`, `0xF1001080`, `0xF1001104`,
+EL0-safe set (v6/v6b corrected: 031546 was on a different kernel/init path; v6 proved 0x1080 fatal, v6b proved 0x1104 fatal): `0xF1001000`, `0xF1001200`,
 `0xF1001200`, all GICC (`0xF1002xxx`).  EL0 and EL1 access to the SAME
 offset are NOT equivalent — never cross-apply a safety conclusion.
 
