@@ -497,3 +497,155 @@ trampoline, or the GIC ACK (IAR read) path.
 - Current Image `646e8684` is the v4 minimal-isolation build, already deployed.
 - ccache now baked into `kernel/build-mv310-718.sh` (`CC="ccache clang"`,
   `CCACHE_DIR=$BASE/.ccache`).
+
+---
+
+## Addendum 6 — root-cause analysis (2026-08-20, expert review)
+
+### A6.1. Key new findings
+
+1. **GICC_CTLR banked proof of NS state**: BL31 CPUON probe reads S-view
+   `gicc_ctlr = 0x1E9` (FIQEn=1, bit1=0), while NS runtime reads `0x3E3`
+   (bit1=1, EOImodeNS). Different banked values confirm the Linux kernel runs
+   in **Non-secure state** — the EL3→NS handover path is correct.
+
+2. **GICC_HPPIR = 0x3FF (spurious, nothing pending)** in the 031546 run (which
+   survived past 1.27 s). Despite `ISENABLER0 = 0x4A00FFFF` showing PPI30
+   (arch timer) enabled, the CPU interface sees zero pending interrupts. This
+   means the **distributor is gating the signal**, not the CPU interface mask.
+
+3. **GICD_CTLR stock TF-A writes only EnableGrp0**: the upstream
+   `gicv2_distif_init()` line was `ctlr | CTLR_ENABLE_G0_BIT` (bit1 missing).
+   Our tree has an uncommitted patch adding `CTLR_ENABLE_G1_BIT`, but the
+   deployed l-loader `56283173` is "unchanged" — almost certainly lacks it.
+
+4. **arch_timer uses PPI30 (phys non-secure), not PPI27 (virt)**:
+   `is_hyp_mode_available()` returns true (kernel entered at EL2) so
+   `arch_timer_select_ppi()` picks `ARCH_TIMER_PHYS_NONSECURE_PPI`. This is
+   normal for nVHE KVM configs and is NOT a bug.
+
+5. **vendor 32-bit kernel uses MMIO timers (SPIs 58/91/59/92), not cp15 timer**:
+   the vendor DT `timer@0xf8a29000` with `clockevent 0-3` on GIC SPIs.
+   The mainline hi3798mv200.dtsi has no MMIO timer node and there is no
+   upstream driver for it. If cp15 PPI30 is unwired on this SoC, a timer
+   porting effort would be needed (lower priority — test H-GATE first).
+
+### A6.2. Top hypothesis: distributor G1 gate (H-GATE)
+
+On GIC-400 with Security Extensions, **NS bit0 of GICD_CTLR is an alias for
+EnableGrp1NS**. Mainline writes `GICD_ENABLE = 0x1` at boot → NS readback
+0x1 → Grp1-NS should be enabled → interrupts should flow. They don't.
+
+This SoC's GIC exhibits two confirmed non-standard behaviors:
+- Writing GICD_CTLR bit1 (NS reserved) from the kernel hangs instantly (v1).
+- Reading ISENABLER0 NS (0xF1001100) from userspace kills the box within ms
+  (v3 and v4; reading 0x1104 is safe).
+
+Both are deviations from GIC-400 spec, proving this is **not a stock GIC-400**.
+If NS bit0 is also a deviation (not a true Grp1-NS alias), then the kernel's
+`GICD_ENABLE = 0x1` does not actually enable Group1, and the only real gate is
+**S-view bit1**, which the stock BL31 left clear.
+
+This explains the full symptom set: zero IRQs, HPPIR=1023, v1 hang (first
+delivery after Grp1 accidentally opened), and the vendor kernel working (its
+bootloader chain is different).
+
+### A6.3. v5 experiment (one-boot discriminator)
+
+The v5 init script replaces v4 in `builds/initramfs/init` (v4 backed up as
+`init.v4.bak`). It adds:
+
+- **ISPENDR0** (0xF1001200): does the distributor see PPI30 pending?
+- **ICFGR0** (0xF1001C00): trigger type as configured
+- **HPPIR + RPR + PMR**: re-reads (proven safe in 031546)
+- **ISENABLER1** (0xF1001104): control read (safe baseline)
+- **Clean SGI8 self-test**: write SGIR `0x02000008` (self, SGI8), then
+  immediately `cat /proc/interrupts` + `dmesg | grep -c MV310-IRQ` —
+  **no sleep anywhere**
+- **HPPIR re-read after SGI**: did the SGI reach the CPU interface?
+
+No reads of 0xF1001100 or 0xF1001300.
+
+**Decision tree:**
+
+```
+ISPENDR0 bit30 = 1  AND  HPPIR = 0x3FF  AND  IPI counts unchanged
+  → H-GATE confirmed: Grp1 gated at distributor.  Rebuild BL31 with
+    EnableGrp1(S) committed, deploy new fip.  Expected: one-shot fix.
+
+ISPENDR0 bit30 = 0  AND  IPI counts++
+  → H-GATE wrong: delivery works, timer PPI is unwired.
+    Port vendor MMIO timer (big effort, plan separately).
+```
+
+### A6.4. Kernel probe patch (v5 Image)
+
+Applied to `drivers/irqchip/irq-gic.c` in the linux-718 tree:
+
+| Patch | Purpose |
+|---|---|
+| `MV310-IRQ-ENTER` before GICC_IAR read | Distinguish "dies before entry" vs "dies at IAR" |
+| `MV310-IRQ-IAR` renamed from old `MV310-IRQ` | Preserve IAR observation |
+| `MV310-GICMAP` expanded with `isenabler0` + `pmr` (kernel-side read) | Userspace never touches 0x1100 again |
+| `MV310-SYSREG` one-shot dump: VBAR_EL1, DAIF, CurrentEL, SCTLR_EL1, MPIDR | Proves vector base is sane; catch vector corruption |
+
+### A6.5. BL31 patch (gicv2_main.c)
+
+Added `printf("MV310-BL31-GICD: ... S-view ctlr=0x%x ...")` at the end of
+`gicv2_distif_init()`. Prints once at cold boot — serial log shows whether
+EnableGrp1 was actually written in the deployed fip. Combined with the
+uncommitted EnableGrp1 write already in the working tree, this makes the fix
+observable in a single boot.
+
+### A6.6. Recommended experiment sequence
+
+1. **v5 initramfs + IRQ-ENTER + SYSREG dump** (same Image rebuild) — 10 min
+2. **Rebuild fip with EnableGrp1(S) committed**, deploy to l-loader — 30 min
+3. **CONFIG_KVM=n** — eliminates nVHE EL2 as confounder (one-line config flip)
+4. If interrupts flow after step 2: add `maxcpus=4` and test full SMP bring-up
+
+
+---
+
+## Addendum 7 (2026-08-20 12:31) — v5b bench: dies right after reading ICFGR0
+
+### 7.1. What changed vs the first v5 boot
+
+The first v5 boot hung at `smp: Bringing up secondary CPUs ...` (no
+`MV310-GIC-V5`) because `refs/configs/kernel.config.mv310` lost
+`maxcpus=1` after the config restore.  v5b restores it, rebuilds with
+ccache (10 min incremental), md5 `0f66239d`, and boots single-core to
+the v5 ladder.  S-view `GICD_CTLR=0x3` (BL31 `MV310-BL31-GICD`) is still
+0x3.
+
+### 7.2. Bench output (last line = death point)
+
+```
+[1.021618] === MV310-GIC-V5 START (ISPENDR + clean SGI self-test) ===
+[1.130534] --- L1: NEW reads first (ISPENDR0 0x1200, ICFGR0 0x1C00) ---
+[1.137353] R-ISPENDR0-BEFORE
+[1.142208] 0x00000000
+[1.145098] R-ISPENDR0-AFTER rc=0
+[1.148485] R-ICFGR0-BEFORE
+[1.153106] 0xAAAAAAAA               <- last line, then dead
+```
+
+Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v5-icfgr0-123155.log`
+
+### 7.3. Reading
+
+1. ISPENDR0 = 0x00000000: no PPI30 pending seen at this instant (so the
+   "pending-but-gated" H-GATE signature is absent this boot).
+2. The kill point moved from ISENABLER0 (v4) to ICFGR0 (v5) but is
+   structurally identical — value printed, next `After` never runs.
+   The v4 "ISACTIVER0 kill" → v4 "ISENABLER0 kill" → v5 "ICFGR0 kill"
+   sequence shows the trigger is devmem-sampling a distributor state
+   that makes an IRQ signal on syscall return.
+
+### 7.4. Next
+
+- Skip ICFGR0 reads entirely; go straight from ISPENDR0 to
+  `SGIR 0x02000008` (SGI8 to self) and check HPPIR.  If that survives,
+  H-VEC vs H-GATE vs H-SRC can be decided in a single boot.
+- Or rely on the kernel-side HPPIR + GICMAP values, which are not
+  subject to the userspace devmem exception path.
