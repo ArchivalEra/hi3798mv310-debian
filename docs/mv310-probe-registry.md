@@ -43,7 +43,7 @@ Fields: `ID | location | fires | reading (what it proves) | status | retire when
 | ID | Location | Fires | Reading | Status | Retire when |
 |---|---|---|---|---|---|
 | `MV310-BL31-GICD` | gicv2_distif_init tail | once per cold boot | S-view GICD_CTLR (`ctlr=0x3` = G0\|G1 open). Sentinel for the S-view state | SENTINEL | end of investigation |
-| `MV310-CPUON-entry` / `-spinlock` / `-validated` / `-pwr_domain_on` / `-cm_init` / `-unlocked` | lib/psci/psci_on.c | once per CPU_ON | which stage of the CPU_ON path ran | DEGRADING: 6 lines spam; E1 trims to entry+unlocked (2) | CPU_ON path adjudicated |
+| `MV310-CPUON-entry` / `MV310-CPUON-unlocked` | lib/psci/psci_on.c | once per CPU_ON | entry + unlocked only (trimmed 6->2 in v6c) | ACTIVE | CPU_ON path adjudicated |
 | `MV310-GIC-on_finish` / `-on_finish-after` | plat/hisilicon/hi3798mv2x/plat_pm.c | once per secondary power-up | `after` printed = TF-A's banked writes on the secondary completed ⇒ wedge is in the kernel sequence; absent ⇒ wedge inside TF-A's gicv2_pcpu_distif_init | ACTIVE (this is the §8.4 E1.4 discriminator) | CPU1 death adjudicated |
 
 ### Retired
@@ -55,18 +55,44 @@ Fields: `ID | location | fires | reading (what it proves) | status | retire when
 
 ### EL0-forbidden MMIO (never in an init script / devmem)
 
-| Offset | Register | Why |
-|---|---|---|
-| `0xF1001100` | ISENABLER0 | historically fatal from EL0 (v3/v4); safe from EL1 (GICMAP probe) |
-| `0xF1001080` | IGROUPR0   | fatal from EL0 (v6: read 0x1080 -> never returned, 75544B log); safe from EL1 (GICMAP probe: IGROUPR0=0xFE00FFFF on every boot) |
-| `0xF1001104` | ISENABLER1 | fatal from EL0 (v6b: read 0x1104 -> never returned); never needed in init script (old value 0x00000000 is noise) |
-| `0xF1001C00` | ICFGR0 | historically fatal from EL0 (v5b) |
-| `0xF1001300` | ISACTIVER0 | v3 death site (later retracted, still off-limits) |
+**Rule (v6c, 2026-08-20): ALL EL0 GIC MMIO is forbidden — reads and
+writes, GICD and GICC alike. No offset is certified safe.**
 
-| `0xF1002000` | GICC_CTLR  | tentatively fatal from EL0 (v6c 1457: read 0x2000->0x3E3 then wedge); previously lived via EL1 GICMAP; NOT yet in forbidden - needs second run |
-EL0-safe set (v6/v6b corrected: 031546 was on a different kernel/init path; v6 proved 0x1080 fatal, v6b proved 0x1104 fatal [v6c GICC_CTLR 0x2000 tentatively fatal, single observation, pending rerun]): : 031546 was on a different kernel/init path; v6 proved 0x1080 fatal, v6b proved 0x1104 fatal): `0xF1001000`, `0xF1001200`,
-`0xF1001200`, all GICC (`0xF1002xxx`).  EL0 and EL1 access to the SAME
-offset are NOT equivalent — never cross-apply a safety conclusion.
+The offset-specific model is falsified by the v6 series: on one kernel
+lineage, five consecutive boots each died at the SECOND EL0 GIC read of
+the boot, across five different registers — 0x1C00 (v5b), 0x1080 (v6),
+0x1104 (v6b), 0x2000 (v6c ×2) — and in every case the read's VALUE
+printed and the next script line never did (the read transaction itself
+always completes; something dies at the following output). 0x1080,
+0x1104 and 0x2000 had all previously SURVIVED EL0 reads in v3/v4/031546
+scripts, so whether an access kills depends on script position/timing,
+not the offset. Best-fit model so far: the first EL0 GIC access arms an
+async poison that kills the CPU or the console ~15-30 ms later (v3 died
+29 ms after its first access, v4 at 28 ms, v5b/v6/v6b/v6c at 16-17 ms);
+only a heartbeat can adjudicate CPU-dead vs console-dead.
+
+Historical per-offset death sites (log archaeology only; the offset is
+NOT the cause):
+
+| Offset | Register | Fatal in | Survived EL0 reads in |
+|---|---|---|---|
+| `0xF1001100` | ISENABLER0 | v3, v4 | — (EL1: every boot, GICMAP) |
+| `0xF1001080` | IGROUPR0 | v6 | v3, v4, 031546 (EL1: every boot, GICMAP) |
+| `0xF1001104` | ISENABLER1 | v6b | 031546 |
+| `0xF1001C00` | ICFGR0 | v5b | — |
+| `0xF1002000` | GICC_CTLR | v6c ×2 — CONFIRMED (serial-v6c-1445.log last boot AND serial-v6c-1457.log last boot; the earlier "needs second run" was satisfied by re-reading the cumulative capture) | v3, 031546 |
+| `0xF1001300` | ISACTIVER0 | v3 (retracted reading, still off-limits) | — |
+
+0xF1001000 as the boot's FIRST EL0 GIC read has survived in every run
+so far — that is position luck, not safety. EL0 and EL1 access to the
+SAME offset are NOT equivalent — never cross-apply a safety conclusion.
+
+Log-file note: serial-v6-1417 / v6b-1430 / v6c-1445 / v6c-1457 are
+cumulative snapshots of one capture (1417 ⊂ 1430 ⊂ 1445 ⊂ 1457; each
+later file contains all earlier boots plus one new boot). Cite the boot
+index within the file, not just the filename. Script banners lagged the
+script version (v6b/v6c still print "V6 START") — identify by the L1
+header comment, and bump the banner string in v7.
 
 ---
 
@@ -110,15 +136,20 @@ Docs and traceability
 
 ---
 
-## 4. Open actions (before the next build)
+## 4. Open actions (before the next build) — done in v7
 
-1. **Trim `MV310-CPUON-*` from 6 lines to 2** (keep `entry` + `unlocked`).
-2. **Register the new E1 probes**: `HB` (raw-UART heartbeat — NOT printk,
-   no registry row possible in code, but document it here) and
-   `GICCPU-STEP [CI-1..CI-7]` (per-MMIO-group markers in gic_cpu_init for
-   the secondary path; low rate — once per CPU — so bare prints are fine).
+1. **DONE — Trim `MV310-CPUON-*` 6→2** (keep `entry` + `unlocked` only; v6b/c build).
+2. **DONE — Register the new E1 probes**: `HB`, `MV310-SGIR`, `GICCPU-STEP [CI-1..CI-7]` (see New in v7 above).
 3. **Freeze the GICMAP format**: it is the EL1-sanctioned ISENABLER0 reader
    and the §6 checklist reference; no more format drift.
+
+### New in v7
+
+| ID | Location | Fires | Reading | Status | Retire when |
+|---|---|---|---|---|---|
+| `MV310-HB` (HB) | raw UART kthread, `drivers/irqchip/irq-gic.c` kthread | every ~50 ms from late_initcall until driver unbind | `HB n=N` line = CPU alive and UART path alive. HB keeps printing but printk stalls => T2 console-dead. HB stops => CPU-dead / wedged. Not a printk, so it covers the case where printk/console itself is the victim (law 12). | ACTIVE | H-VEC vs T2 adjudicated, then down-rate or remove |
+| `MV310-SGIR` | `/proc/mv310_sgir` write handler, `drivers/irqchip/irq-gic.c` | on demand (one `echo 8 > /proc/mv310_sgir` per boot) | header `S-view GICD_CTLR snapshot` before the write; `BEFORE`/`AFTER` SPENDSGIR0 + HPPIR + `MV310-IRQ-ENTER/-IAR` line counts after. BEFORE/AFTER spend bit8=1 + hppir=0x3FF + 0 ENTER => H-GATE (SGI) confirmed; ENTER+IAR printed => delivery + vector + ACK all OK (then H-SRC). | ACTIVE | H-GATE-SGI adjudicated |
+| `GICCPU-STEP [CI-1..CI-7]` | `gic_cpu_init()` step markers, `drivers/irqchip/irq-gic.c` | once per CPU (boot CPU + each secondary entering gic_cpu_init) | `CI-N` printed = code reached that group boundary. Last CI seen names the wedge window (e.g. CI-5 printed but CI-6 missing => wedge between CI-5 and CI-6). Carried into the v7 build so the next maxcpus=4 boot costs zero extra. | ACTIVE | CPU1 death window adjudicated |
 
 ## 5. Relationship to the three-piece deployment
 
