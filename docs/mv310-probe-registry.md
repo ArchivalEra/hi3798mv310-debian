@@ -63,7 +63,8 @@ Fields: `ID | location | fires | reading (what it proves) | status | retire when
 | `0xF1001C00` | ICFGR0 | historically fatal from EL0 (v5b) |
 | `0xF1001300` | ISACTIVER0 | v3 death site (later retracted, still off-limits) |
 
-EL0-safe set (v6/v6b corrected: 031546 was on a different kernel/init path; v6 proved 0x1080 fatal, v6b proved 0x1104 fatal): `0xF1001000`, `0xF1001200`,
+| `0xF1002000` | GICC_CTLR  | tentatively fatal from EL0 (v6c 1457: read 0x2000->0x3E3 then wedge); previously lived via EL1 GICMAP; NOT yet in forbidden - needs second run |
+EL0-safe set (v6/v6b corrected: 031546 was on a different kernel/init path; v6 proved 0x1080 fatal, v6b proved 0x1104 fatal [v6c GICC_CTLR 0x2000 tentatively fatal, single observation, pending rerun]): : 031546 was on a different kernel/init path; v6 proved 0x1080 fatal, v6b proved 0x1104 fatal): `0xF1001000`, `0xF1001200`,
 `0xF1001200`, all GICC (`0xF1002xxx`).  EL0 and EL1 access to the SAME
 offset are NOT equivalent — never cross-apply a safety conclusion.
 
