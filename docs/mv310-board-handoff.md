@@ -977,3 +977,58 @@ PONR to see if console is lock-dead vs flush-starved.
 | `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `a1cec64cce8da0bb01cd0e6efd7e59bb` |
 
 Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v7.2-hb-live-191606.log`
+
+
+---
+
+# Addendum 11 (2026-08-21 19:36) - v7.3: printk healthy, console flush starved -> FAULTS A AND B UNIFY
+
+## 11.1. v7.3 changes (Image `4de5190d`)
+
+HB kthread gains a one-shot console probe at beat 25 (~5 s): raw-UART
+'B' before, one `pr_info("MV310-CONSOLE-PROBE ...")`, raw-UART 'D'
+after; counters exposed via `/proc/mv310_hb`.  Init L0 reads that proc
+file first.
+
+## 11.2. Bench result
+
+```
+HHHH...H B[0.924224] MV310-CONSOLE-PROBE: printk attempt from HB kthread n=25
+D HHHH... (continuous)
+```
+
+All three markers landed: printk was CALLED, RETURNED, and its text
+REACHED THE UART.  The console is not lock-dead.
+
+## 11.3. Reading - the two faults are ONE fault
+
+The probe printk ran in a SCHED_FIFO never-sleeping kthread: in that
+context printk takes the synchronous path straight to the UART.
+Userspace `echo` (init script) goes to the kmsg queue and is flushed
+by console code that needs the scheduler to run - and the scheduler
+needs a timer tick - and the tick needs PPI30 which never fires.
+
+**Fault A (console silence) is a SYMPTOM of Fault B (no timer IRQ).**
+One root cause: cp15 phys timer PPI30 never asserted on mv310
+(H-SRC).  Fixing the timer resurrects console, sleep, scheduler,
+and quite possibly SMP bringup with it.
+
+## 11.4. Next cut (single, decisive): E3 timer port
+
+Port the vendor MMIO timer as clockevent:
+- node `timer@0xf8a29000`, compatible "hisilicon,timer"
+- SPIs 58/91/59/92 (four cores), from the vendor 32-bit DT
+- mainline has no driver for this IP; vendor BSP
+  (SPC070 histb) has the reference
+Acceptance: `arch_timer`-independent tick appears in /proc/interrupts,
+console flushes userspace echo, `sleep 1` returns, then maxcpus=4.
+
+## 11.5. Current three-piece set
+
+| File | md5 |
+|---|---|
+| `/srv/tftp/mv310-Image-7.1.8-gicgrp1` | `4de5190da07ea11195067c781d63eec0` |
+| `/srv/tftp/mv310-l-loader-gicgrp1.bin` | `7cfe066218c14f1e2e9f2b33a079ca56` |
+| `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `a1cec64cce8da0bb01cd0e6efd7e59bb` |
+
+Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v7.3-probe-alive-193607.log`
