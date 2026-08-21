@@ -1094,3 +1094,71 @@ GICD_ISPENDR1 bit 30) while IRQs are blocked:
   GICD_CTLR NS-bit0 alias semantics differ on this chip.
 
 Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v8.1-m4-210412.log`
+
+
+---
+
+# Addendum 13 (2026-08-21) - v8.3: S-view EnableGrp1 set (0x1eb), forward path STILL dead
+
+## 13.1. v8.3 changes
+
+BL31 `gicv2_cpuif_enable()` now sets `CTLR_ENABLE_G1_BIT` in the
+secure-bank GICC_CTLR (was 0x1e9, now 0x1eb - confirmed by
+`MV310-GICMAP-EARLY: gicc_ctlr=0x1eb` on this boot).
+l-loader `2987ce29`.  fb-run.py gained a fastboot# gate
+(`ensure_fastboot`) that refuses to run outside fastboot.
+
+## 13.2. Bench result
+
+```
+MV310-GICMAP-EARLY: gicc_ctlr=0x1eb        <- S-view Grp1 gate OPEN
+MV310-PEND: SPI30 -> hppir=0x3ff rpr=0xff  <- still never forwarded
+M1..M4 then silence; SGIR spend=0 reproduced
+```
+
+## 13.3. Reading
+
+The S-view CPU-interface gate is now fully open and the forward path
+is STILL dead: a software-pended SPI, with IRQs blocked, never appears
+in HPPIR.  Every programmable knob we can reach from NS or via BL31 is
+now proven correct:
+
+| Knob | Value | State |
+|---|---|---|
+| GICD_CTLR (NS) | 0x1 | enabled |
+| GICD_CTLR (S, BL31) | 0x3 | G0+G1 |
+| IGROUPR0 | 0xfe00ffff | SGI/PPI Group1 |
+| IGROUPR1+ | all ffffffff | SPI Group1 |
+| ISENABLER0 | 0xffff | SGIs on (+PPIs later) |
+| GICC_CTLR (NS) | 0x3e3 | both groups + EOI mode |
+| GICC_CTLR (S) | 0x1eb | **Grp1 now open** |
+| GICC_PMR | 0xf0 | unmasked |
+| ISPENDR write | accepted | pend visible? NO |
+
+Remaining explanations, in order:
+1. **The distributor's Group1->CPU-interface forwarding hardware path
+   is broken/fused on mv310** (security fuse strapping the GIC into a
+   non-standard secure-only forwarding mode).  The vendor kernel works
+   because it runs its timers through... something else, or because
+   its bootloader configures a register we have not found.
+2. A hidden global config register (non-architectural, vendor-specific)
+   gates Group1 forwarding.
+3. HPPIR itself is broken for Group1 on this chip while actual IRQ
+   delivery would work - testable by enabling one timer IRQ and
+   spinning with DAIF masked to see if the IRQ *pending* bit in GICC
+   (via IAR polling loop) ever returns non-spurious.
+
+## 13.4. Next cut (decisive, no more config)
+
+Poll GICC_IAR directly in a tight EL1 loop with IRQs masked, after
+enabling the mv310-timer IRQ and letting the hardware fire it:
+- IAR returns 62 (the timer SPI): delivery WORKS end-to-end; only
+  HPPIR reads are unreliable on this chip -> normal interrupt handling
+  should just work; investigate why handlers never ran (affinity?
+  enable order?).
+- IAR returns 1023 forever: Group1 delivery is truly dead at the
+  hardware level -> the remaining move is vendor-BSP archaeology
+  (find the undocumented register) or running everything through
+  Group0/FIQ with our own FIQ handler.
+
+Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v8.3-grp1s-*.log`
