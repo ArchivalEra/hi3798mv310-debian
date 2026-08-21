@@ -1219,3 +1219,51 @@ IARPOLL block with guard order `>=1000` checked BEFORE `>=32`, then:
 
 Key logs: serial-v8.1-m4-210412.log, serial-v8.3-grp1s-213632.log,
 serial-v8-timer1-204604.log (all under notes/logs/).
+
+
+---
+
+# Addendum 15 (2026-08-22 00:58) - v10.3: poll clockevent NEVER fires; CP15 counter does not advance under poll
+
+## 15.1. What v10.3 proved (the retry machinery worked perfectly)
+
+The verifier kthread ran, retried visibly, and the boot continued -
+no wedge this time.  Log:
+
+```
+MV310-TIMEBASE: attempt 1/3 registering arch-poll...
+MV310-TIMEBASE: arch-poll clockevent registered on cpu0
+MV310-TIMEBASE: attempt 0 no tick, retrying        <- 5 s check: DEAD
+MV310-TIMEBASE: attempt 2/3 registering arch-poll...
+(then the attempt-2 wait loop; log static - see below)
+```
+
+## 15.2. The decisive negative result
+
+**The polling clockevent never fires.**  The handler counter stayed 0
+and jiffies never advanced across a full 5-second preemptible window
+in which the poll thread demonstrably ran (attempt 0 completed its
+whole check and printed "retrying" - the machinery is proven live).
+
+Two possible readings:
+1. `arch_timer_read_counter()` (CNTPCT read) returns a FROZEN value
+   on mv310 - the cp15 counter itself does not advance in this
+   kernel/boot path.  Note the scheduler timestamp DID advance
+   during early boot ("arch_sys_counter" via the memory-mapped
+   counter at a different register page), so if CNTPCT is frozen,
+   that pinpoints the cp15 interface as dead, not just PPI30.
+2. The poll loop's cond_resched() yields but the poll thread still
+   gets starved by the retry loop's own busy-wait (both SCHED_NORMAL,
+   same CPU).  Attempt 2 hanging mid-check is consistent with this.
+
+Discriminator for next session: print CNTPCT twice inside the
+verifier (start and end of the 5 s window).  If both prints show the
+SAME value -> the cp15 counter is frozen -> arch-timer is fully dead
+on mv310 (counter + PPI); only the MMIO timer blocks remain as a
+real timebase, and the GIC Group1 forward path must be cracked or
+bypassed (FIQ handler) for them to be usable.
+
+## 15.3. Session state
+
+Deployed: Image `05bb7177` / l-loader `d26a79dd` / dtb `8698afc9`.
+Log: `serial-v10.3-poll-dead-005017.log`.
