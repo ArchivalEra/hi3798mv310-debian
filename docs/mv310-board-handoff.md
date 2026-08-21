@@ -1267,3 +1267,60 @@ bypassed (FIQ handler) for them to be usable.
 
 Deployed: Image `05bb7177` / l-loader `d26a79dd` / dtb `8698afc9`.
 Log: `serial-v10.3-poll-dead-005017.log`.
+
+
+---
+
+# Addendum 16 (2026-08-22 02:12) - v11: clean upstream TF-A, behavior unchanged
+
+## 16.1. Experiment
+
+Rebuilt BL31 from pristine `origin/hi3798mv2x_mainline` (the tree
+hataketsu used to boot mainline on the sibling MV300 with working
+GIC + PPI30) - no EnableGrp1 write, no prints.  l-loader
+`28c8cc37`.  Image v10.4 (fallback chain + CNTPCT discriminator).
+
+## 16.2. Result
+
+```
+BL31: Built : 02:09:28, Aug 22 2026        <- clean tree confirmed
+(no MV310-BL31-GICD line - print removed, as expected)
+U-Boot boots, booti runs, kernel starts
+MV310-TIMEBASE: CNTPCT start=... end=... ADVANCED jiffies frozen
+attempt 0 no tick, retrying -> attempt 2/3 -> serial silence
+```
+
+Identical to v10.x with our modified BL31.  **The EnableGrp1(S)
+write changes nothing on mv310** - removing it did not make Group1
+delivery worse, and (from v8.3) adding it did not make it better.
+
+## 16.3. Conclusions
+
+1. The S-view GICC_CTLR.EnableGrp1 knob is NOT the gate on this SoC.
+2. Combined with Addendum 15 (CNTPCT advances, so the counter is
+   alive; only the interrupt never fires), the fault domain narrows
+   to: PPI/SPI -> GIC CPU interface signaling for Group1 - OR the
+   arch timer's output pin itself.
+3. Research findings now in play:
+   - NS writes to GICD_IGROUPR are silently ignored when Security
+     Extensions are enabled (KVM "IGROUPR reads as zero" series) -
+     our NS-side IGROUPR verification was invalid all along.
+   - SDK TF-A has plat/hisilicon/hi3798mv200 with secure IRQ array
+     {60,50,52,88} (timer SPIs routed to secure world!) and legacy
+     arm_gic setup that writes IGROUPR=~0 FROM EL3.
+   - CNTHCTL.PL1PCEN/PL1PCTEN: if clear, CNTP_CVAL access traps to
+     EL3 or is dropped - exactly "counter runs, IRQ never fires".
+
+## 16.4. Next cut (v11.1)
+
+1. Re-add ONE minimal probe: GICMAP-EARLY (gicc_ctlr/pmr at
+   gic_cpu_init entry) - needed to see S-view state under clean TF-A.
+2. In BL31 (clean tree + one commit): after gicv2_distif_init, from
+   EL3 write GICD_IGROUPRn(32..N) = ~0 (all SPIs Group1) exactly like
+   SDK arm_gic_distif_setup does, plus GICD_CTLR |= EnableGrp1.
+3. Check/print CNTHCTL_EL1 PL1PCEN/PL1PCTEN bits from EL3.
+4. Fix poll clockevent per research: rating 500 (>450 beats dead
+   arch_timer), handler invoked inside irq_enter + dummy pt_regs,
+   bootargs highres=off nohz=off.
+
+Log: serial-v11-clean-tfa-*.log
