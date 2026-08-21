@@ -37,6 +37,7 @@ Fields: `ID | location | fires | reading (what it proves) | status | retire when
 | `MV310-GICMAP-EARLY` | gic_cpu_init entry | once per CPU | `cpu=N` = that CPU entered gic_cpu_init; per-CPU banked gicc_ctlr/pmr snapshot | ACTIVE | merged into GICMAP, or CPU1 death adjudicated |
 | `MV310-GICMAP` | gic_cpu_init tail | once per CPU | isenabler0 read from EL1 (the ONLY sanctioned read of 0xF1001100); cpu_map sanity | ACTIVE | SMP brings up |
 | `MV310-SYSREG` | gic_cpu_init tail | once per CPU | VBAR_EL1 / DAIF / CurrentEL / SCTLR_EL1 / MPIDR snapshot | ACTIVE (one-shot, cheap) | vector routing adjudicated |
+| `MV310-EL1-ENTER` | `arch/arm64/kernel/entry-common.c:el1_interrupt` entry, `noinstr` | every EL1 IRQ/FIQ (raw UART 'E') | printed = interrupt reached EL1 vector alive; HB alive but no E => vector never entered; E printed + no IRQ-ENTER => wedge between vector and gic_handle_irq | ACTIVE | H-VEC adjudicated |
 
 ### ATF side (EL3)
 

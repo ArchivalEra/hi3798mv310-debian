@@ -721,7 +721,7 @@ Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v5-icfgr0-123155.log`
 
 ## 8.2 Three corrections to the v5b reading (§7.3 items 2-3 are retracted)
 
-1. **"取中断即死" (die on interrupt take) is NOT supported by v5b's own
+1. **"die on interrupt take" is NOT supported by v5b's own
    data.** At 1.142s ISPENDR0=0x00000000 — nothing pending (no SGI, no PPI;
    no SPIs enabled), so in the ICFGR0→echo window there was nothing legal to
    deliver. MV310-IRQ-ENTER — the TRUE first statement of gic_handle_irq,
@@ -829,7 +829,7 @@ E5 If E1.2 pins CPU1's death to a specific op: test the H2 fix — BL31
 ## 8.5 Handoff corrections and new discipline entries
 
 - Retract §7.3 items 2-3 (the "devmem sampling → IRQ re-enable window"
-  mechanism) and 8's "判读" accordingly.
+  mechanism) and section 8's reading accordingly.
 - A4/B1: post-SGIR silence in 031546 is "undetermined", not "sleep confound"
   — under T1 the EL0 SGIR write itself is a wedge candidate.
 - New discipline entries:
@@ -842,3 +842,70 @@ E5 If E1.2 pins CPU1's death to a specific op: test the H2 fix — BL31
      timer is fixed — no hang can time out or self-report.
   4. "Serial silence" proves nothing about life or death — always run a
      heartbeat before interpreting silence.
+
+
+---
+
+# Addendum 9 (2026-08-21) - v7/v7.1: zero-touch death without EL0 GIC access
+
+## 9.1. v7 first run (Image `4e494b75`, probes-v7)
+
+- `MV310-BL31-GICD ctlr=0x3`, `GICCPU-STEP CI-1..7 cpu=0` all pass,
+  `GICMAP 0x3e3/0xFFFF`, `SYSREG VBAR 0xffff800080011000`.
+- **M1-M5 survived** (1.15/2.52/3.88/5.25/6.61 s); M6 never printed.
+- `MV310-SGIR BEFORE/AFTER spend=0x00000000 hppir=0x3FF` at t=69 s:
+  the EL1 SGIR write executes but the distributor never pends SGI8.
+- **HB n=1 only** - the raw-UART heartbeat was starved by the M-loop
+  (or taken by the same wedge), so CPU-dead vs console-dead stayed
+  undecidable.
+
+## 9.2. v7.1 instrument fix (Image `147309b4`, probes-v7.1)
+
+Seven changes in one rebuild:
+1. HB: `SCHED_FIFO(1)` + single-byte `H` + interval 50->200 ms.
+2. `mv310_hb_base` exported (`EXPORT_SYMBOL_GPL`) for cross-file use.
+3. `entry-common.c el1_interrupt` first line: `MV310-EL1-ENTER`
+   raw-UART `'E'` probe (noinstr-safe, reuses HB mapping).
+4. initramfs: M-loop 80000->20000 + `usleep 10000` every 5 markers;
+   C segment (EL0 0xF1001100) now conditional on HB+SGIR being seen;
+   banner versioned `V7.1`.
+5. ATF `gicv2_main.c`: added `MV310-BL31-HCR: hcr_el2/vbar_el2` print
+   (the only untested routing register; ships with the next l-loader).
+6. probe-registry: new `MV310-EL1-ENTER` row.
+7. fb-run.py: wait_for extended to `['M1','Z-DONE','P-AFTER-SGIR','HB',
+   'MV310-GIC-V7']`, timeout 35->60 s.
+
+## 9.3. v7.1 result (log `serial-v7.1-m5-184011.log`)
+
+- Single-byte `H` at t=0.952 s (before the clk line) - HB priority works.
+- `M1-M5` continuous to t=2.51 s (v7 was 6.6 s; the yield works),
+  **M6 still never printed**.
+- Same shape as v7: the zero-touch segment dies with NO GIC access.
+  **The "first EL0 GIC access arms the poison" model is falsified by
+  both v7 and v7.1.** Suspects narrow to T1 (fabric/console wedge,
+  time-based not position-based) or the HB FR.TXFF poll itself
+  stalling the UART window.
+
+## 9.4. Questions for the expert
+
+1. M5->M6 silence reproduced at two different timings (v7 6.6 s,
+   v7.1 2.5 s). Does this support a fixed-window fabric death rather
+   than script-position coincidence? Next cut: HCR_EL2 (BL31-HCR is
+   built, ships next l-loader) or the entry-common E probe?
+2. HB still printed only once (0.952 s). Is the FR.TXFF poll wedging
+   (direct T1 fabric-stall evidence) or is the kthread starved again?
+   Suggestion: drop the TXFF spin cap from 10000 to 100 and print an
+   overflow counter.
+3. SGIR spend=0 reproduced in v7 (t=69 s). If v7.1 rerun shows spend=0
+   again WITH a continuous HB, H-GATE-SGI is confirmed and we move to
+   E3 (port vendor MMIO timer `timer@0xf8a29000`, SPIs 58/91/59/92).
+
+## 9.5. Current three-piece set
+
+| File | md5 |
+|---|---|
+| `/srv/tftp/mv310-Image-7.1.8-gicgrp1` | `147309b49e0d2614856e29ad018c4522` |
+| `/srv/tftp/mv310-l-loader-gicgrp1.bin` | `7cfe066218c14f1e2e9f2b33a079ca56` |
+| `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `a1cec64cce8da0bb01cd0e6efd7e59bb` |
+
+Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v7.1-m5-184011.log`
