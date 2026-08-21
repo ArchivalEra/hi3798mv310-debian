@@ -1162,3 +1162,60 @@ enabling the mv310-timer IRQ and letting the hardware fire it:
   Group0/FIQ with our own FIQ handler.
 
 Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v8.3-grp1s-*.log`
+
+
+---
+
+# Addendum 14 (2026-08-21, session close) - final state and where to resume
+
+## 14.1. Session outcome in one paragraph
+
+Two days of probe work did not make the board tick, but it converted
+an opaque SMP hang into a precisely bounded fault: **the GIC's
+Group1->CPU-interface forwarding path never delivers anything on
+mv310** - a software-pended SPI with IRQs masked never appears in
+HPPIR (v8.2/v8.3), even after every architectural knob was verified
+correct including the S-view GICC_CTLR EnableGrp1 (0x1eb, v8.3).
+The cp15 arch timer PPI30 additionally appears unwired (H-SRC), but
+that is now secondary: the new MMIO timer driver registers cleanly
+and would deliver the tick the moment Group1 forwarding works.
+
+## 14.2. Deployed three-piece set (current /srv/tftp)
+
+| File | md5 | Contents |
+|---|---|---|
+| `mv310-Image-7.1.8-gicgrp1` | `28320428c7eee5c5a9698a7135c53797` | v8.4: mv310-timer driver + IGROUPR1+ Group1 writes + SGIR/PEND/IARPOLL proc probes |
+| `mv310-l-loader-gicgrp1.bin` | `2987ce2911cd9a44aa785f2e774546d7` | BL31 with S-view GICC EnableGrp1 + distif Grp1 + SCR_EL3/HCR prints |
+| `mv310-tvbox-7.1.8.dtb` | `8698afc91a3fc15d94fd72e55361051f` | 4x MMIO timer blocks (2-cell reg, fixed) |
+
+## 14.3. New assets created this session
+
+- `drivers/clocksource/timer-mv310.c` - working per-CPU clockevent
+  driver for the vendor SP804-variant blocks; probes and registers
+  all four CPUs.  UNCOMMITTED in kernel tree (irq-gic.c restored to
+  last-good; timer driver + Kconfig/Makefile/dts changes remain).
+- `/proc/mv310_sgir` (EL1 SGI self-test + SPI pend probe)
+- fb-run.py `ensure_fastboot()` gate - refuses to run outside fastboot.
+- Probe registry rows: HB/SGIR/GICCPU-STEP/EL1-ENTER lifecycle.
+
+## 14.4. Verified-correct configuration (do not re-test)
+
+GICD_CTLR NS=0x1 / S=0x3; IGROUPR0=0xfe00ffff; IGROUPR1+=all-1;
+ISENABLER0=0xffff; GICC_CTLR NS=0x3e3 / S=0x1eb; PMR=0xf0;
+SCR_EL3 bits[1:0]=0.  A software-pended SPI still never reaches
+HPPIR (hppir=0x3ff, rpr=0xff).
+
+## 14.5. Resume point (next session)
+
+The v8.4 IAR-poll build had a branch-order bug (1058 hit the PEND
+branch) - irq-gic.c has been restored to the v8.3 state; re-apply the
+IARPOLL block with guard order `>=1000` checked BEFORE `>=32`, then:
+1. arm timer via `/proc/mv310_timer_ctrl` (driver support already in),
+2. poll GICC_IAR ~2M times with IRQs masked,
+3. IAR=58 -> delivery works, HPPIR unreliable -> debug handler path.
+   IAR=1023 forever -> hardware/fuse-level Group1 dead -> vendor-BSP
+   archaeology for a hidden forwarding register, or run Linux on
+   Group0/FIQ with a custom FIQ handler.
+
+Key logs: serial-v8.1-m4-210412.log, serial-v8.3-grp1s-213632.log,
+serial-v8-timer1-204604.log (all under notes/logs/).
