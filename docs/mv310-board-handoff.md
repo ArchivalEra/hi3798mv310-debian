@@ -1032,3 +1032,65 @@ console flushes userspace echo, `sleep 1` returns, then maxcpus=4.
 | `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `a1cec64cce8da0bb01cd0e6efd7e59bb` |
 
 Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v7.3-probe-alive-193607.log`
+
+
+---
+
+# Addendum 12 (2026-08-21 21:06) - v8.1: timer registers, but tick still absent; M4 death persists
+
+## 12.1. v8.1 (Image `59577cdd`, dtb `8698afc9`)
+
+Changes: HB/CONSOLE-PROBE removed entirely; new driver
+`drivers/clocksource/timer-mv310.c` wires the four vendor MMIO timer
+blocks as per-CPU clockevents (first boot: CPU0 block @0xf8a2a000,
+hwirq 58); `gic_dist_init` now writes ALL IGROUPRn banks 0xffffffff
+(SPIs forced to Group1/NS - BL31 only ever programmed IGROUPR0).
+First v8 attempt failed with `Failed to initialize '/timer@f8a2a000':
+-6` because reg used 1-cell addresses under #address-cells=2; fixed.
+
+## 12.2. Bench result
+
+```
+14: 0  GICv2 58 Level mv310-timer      <- registered, probe OK
+15: 0  GICv2 91 Level mv310-timer
+16: 0  GICv2 59 Level mv310-timer
+17: 0  GICv2 92 Level mv310-timer
+M1(1.22) M2(1.56) M3(1.90) M4(2.24)
+[18.24] MV310-SGIR BEFORE spend=0x00000000 hppir=0x3ff
+[18.25] MV310-SGIR AFTER  spend=0x00000000 hppir=0x3ff
+(silence; log static at 676647 bytes for 2+ min)
+```
+
+## 12.3. Reading
+
+1. The driver probed and registered four clockevents - the of_iomap
+   fix worked, request_irq succeeded.
+2. **The counters stay 0**: no mv310-timer interrupt EVER fired.
+   Either the timer block does not count/assert, or SPI 58 is still
+   not delivered despite the IGROUPR1+ Group1 writes.
+3. The M-loop died between M4 and M5 again (~2.3 s), then the script
+   CONTINUED (SGIR ran at t=18 s) - output resumed after a ~16 s gap,
+   consistent with kmsg buffer flush when SGIR's pr_info pushed it.
+   Console is alive but flush-starved; the tick is still missing.
+4. spend=0 after self-SGI write REPRODUCED on a boot where all SPIs
+   are Group1. Combined with zero timer IRQ: **the distributor is not
+   forwarding Group1 interrupts to the CPU interface** even though
+   GICD_CTLR(NS)=0x1, GICC_CTLR=0x3e3, IGROUPR all-Group1,
+   ISENABLER0=0xffff. H-GATE moves back to the top of the list -
+   specifically the S-view EnableGrp1 path or a security-level quirk
+   unique to this SoC's GIC.
+
+## 12.4. Next cut
+
+Read GICC_HPPIR + GICC_RPR from EL1 immediately after forcing a
+software pend (write ISPENDR0 bit for an unused SPI, e.g. SPI 30 ->
+GICD_ISPENDR1 bit 30) while IRQs are blocked:
+- HPPIR shows the SPI -> distributor->CPU interface works; problem is
+  delivery/ack (check GICD_CTLR S-view via BL31 print, PMR, RPR).
+- HPPIR stays 1023 -> the pend itself never becomes visible: the
+  distributor's Group1 path is dead despite config = silicon/firmware
+  gate. Next suspect: BL31 must set GICC_CTLR.EnableGrp1 in the
+  *secure* bank too (current S-view value 0x1e9 has bit1=0), or use
+  GICD_CTLR NS-bit0 alias semantics differ on this chip.
+
+Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v8.1-m4-210412.log`
