@@ -1324,3 +1324,71 @@ delivery worse, and (from v8.3) adding it did not make it better.
    bootargs highres=off nohz=off.
 
 Log: serial-v11-clean-tfa-*.log
+
+
+---
+
+# Addendum 17 (2026-08-22 03:30) - session close: toolchain regression, state, and the five-day arc
+
+## 17.1. Why today's TF-A builds broke
+
+BL2 grew from 12657 B (Aug 21, boots fine) to 20865 B (Aug 22, "error
+initializing fip") - **from identical source**.  Pure `origin` checkout
+reproduces 20865 B, so the cause is the host toolchain (gcc upgraded
+on the build host between the two dates), not our code.  BL1's fip
+loader appears to have a size budget that the new BL2 exceeds, and my
+byte-splice hybrid attempts made it worse (truncated BL31 -> image id
+3 load failure).  Lesson recorded: when a boot chain breaks after a
+host rebuild, suspect the toolchain first; never hand-splice firmware
+images.
+
+## 17.2. Deployed state (session close)
+
+| File | md5 | Note |
+|---|---|---|
+| `/srv/tftp/mv310-l-loader-gicgrp1.bin` | `2987ce29...` | **last known-good** (v8.3 era, boots to initramfs) |
+| `/srv/tftp/mv310-Image-7.1.8-gicgrp1` | `a1c5f252...` | v10.4: fallback chain + CNTPCT discriminator |
+| `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `8698afc9...` | 4x MMIO timer blocks |
+
+Board needs a FULL POWER CYCLE (not reset) - it wedges in the broken
+hybrid BL2.
+
+## 17.3. Build scripts added (all ccache-forced)
+
+- `bootloader/build-mv310-tfa.sh` - wrapper-PATH ccache (100+ hits)
+- `bootloader/build-mv310-lloader.sh` - wrapper ccache for timer.c
+- kernel `build-mv310-718.sh` - already ccache'd
+- **Caveat for next session**: rebuilds with the CURRENT host gcc
+  produce a bloated BL2 that BL1 rejects.  Either downgrade gcc, or
+  extract bl1/fip from the archived working l-loader and only rebuild
+  what changed.
+
+## 17.4. Research deliverables (three-agent sweep, in repo history)
+
+1. Same-family proof: `hataketsu/hi3798mv300-mainline` boots mainline
+   7.2-rc5 on MV300 with GIC + PPI30 working, using
+   `185264646/ATF-hi3798mv2x@hi3798mv2x_mainline` (poplar_gicv2.c
+   identical to upstream).  Our board is NOT an unwirable outlier.
+2. NS writes to GICD_IGROUPR are silently ignored when Security
+   Extensions are on (KVM IGROUPR-RAZ series) - two days of NS-side
+   IGROUPR "verification" was methodologically void.
+3. SDK TF-A (`JasonFreeLab/HiSTBLinuxV100R005C00SPC050`) ships
+   `plat/hisilicon/hi3798mv200` with secure IRQ array {60,50,52,88}
+   and EL3-side IGROUPR=~0 setup; vendor 64-bit kernel uses arch timer
+   PPI30 + SP804 dual-track with explicit clock-frequency=24MHz.
+4. Poll clockevent requirements (source-verified): rating must exceed
+   the dead arch_timer's 450; handler must run inside irq_enter with
+   valid regs; highres=off nohz=off for simplest periodic mode.
+5. Group0/FIQ path requires EL3 mediation (Rockchip TZ model) - not
+   viable as a quick fix; S-view GICC EnableGrp1 knob proven irrelevant
+   (v8.3/v11 A-B test).
+
+## 17.5. Resume point
+
+1. Fix the toolchain regression (downgrade host gcc or pin the old
+   one), rebuild TF-A, verify BL2 = 12657 B again.
+2. Then the EL3-side experiment queue: CNTHCTL.PL1PCEN/PL1PCTEN dump,
+   EL3-written IGROUPR verification (via EL3 readback, not NS),
+   S-view GICC_PMR check.
+3. Then poll clockevent with rating 500 (kernel side already fixed,
+   Image `a1c5f252` ready).
