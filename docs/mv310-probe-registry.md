@@ -97,6 +97,25 @@ header comment, and bump the banner string in v7.
 
 ---
 
+
+### Retired in v9 (2026-08-21 probe cleanup)
+
+| ID | Retire note |
+|---|---|
+| `MV310-HB` / raw-UART heartbeat | mission complete: proved CPU-alive vs console-dead (v7.2); msleep/timer dependency found; removed from irq-gic.c |
+| `MV310-SGIR` (/proc/mv310_sgir) | adjudicated H-GATE-SGI: spend=0 reproduced with full config; removed |
+| `MV310-PEND` SPI pend probe | decisive: hppir=0x3ff with all knobs correct -> hardware forward path dead; removed |
+| `MV310-CONSOLE-PROBE` | printk healthy in FIFO context -> flush starvation confirmed; removed |
+| `/proc/mv310_timer_ctrl` debug proc | bench-only; removed from timer driver |
+| `MV310-CPUON-*`, `MV310-GIC-on_finish*`, `MV310-BL31-HCR` | CPU_ON path and EL2 routing no longer suspects; removed from ATF |
+| initramfs ladder scripts (M1-M50, Z-DONE, C-challenge) | replaced by clean boot script with sleep canary |
+
+Kept: `MV310-TIMER` registration print (driver one-shot), `MV310-BL31-GICD`
+SENTINEL. Kernel irq-gic.c now carries ZERO probes - only the two mv310
+fixes (GICC EnableGrp1 + IGROUPR SPI banks).
+
+---
+
 ## 3. Maintenance rules (the 15 laws)
 
 Naming and identity
