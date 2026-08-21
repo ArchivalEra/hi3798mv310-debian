@@ -909,3 +909,71 @@ Seven changes in one rebuild:
 | `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `a1cec64cce8da0bb01cd0e6efd7e59bb` |
 
 Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v7.1-m5-184011.log`
+
+
+---
+
+# Addendum 10 (2026-08-21 19:16) - v7.2: CPU ALIVE, console dead (T2' CONFIRMED)
+
+## 10.1. v7.2 changes (Image `a9423ce`, probes-v7.2)
+
+Self-driven fix after v7.1: the single HB beat was **msleep()**, which
+never returns on this board (zero timer IRQs).  v7.2 replaces it with a
+busy-wait loop (no timer dependency), TXFF spin cap 10000->100 with an
+overflow 'T' marker, and removes the timer-dependent `usleep` from the
+init M-loop.
+
+## 10.2. Bench result - the decisive cell
+
+```
+HHHHHHHHHHHHHHHH... (continuous, thousands of beats, still streaming)
+```
+
+- `H` stream: CONTINUOUS - CPU0 is alive, fabric alive, UART alive,
+  FR.TXFF never sticks (zero 'T' overflow markers).
+- `MV310-GIC-V7.2` banner: NEVER printed. Zero M markers. Zero kmsg.
+
+**The init script's very first echo never reached the console, while
+the raw-UART heartbeat on the SAME physical UART streams forever.**
+
+## 10.3. Reading - T2' confirmed, whole history reinterpreted
+
+1. **CPU is alive; the printk->console path is dead.**  The hardware
+   UART works (HB proves it); the kernel's console layer wedged.
+2. All previous "system hung" readings must be reinterpreted:
+   every "value printed, next line never" death was the console
+   pipeline dying mid-boot, not the CPU dying.
+3. The SGIR spend=0 at t=69 s in v7 was real execution (late kmsg
+   flush) - the script kept running after output died.
+4. sleep never returning is REAL but SEPARATE (H-SRC: timer PPI30
+   never fires).  Two independent faults, now cleanly separated:
+   - Fault A (this addendum): printk/console wedge - masks everything.
+   - Fault B: zero timer IRQs (H-SRC / H-GATE-PPI) - hidden behind A.
+
+## 10.4. Next cut (Fault A first - it masks all observation)
+
+Suspects inside printk->earlycon path, in order:
+1. `console_lock`/`console_trylock` deadlock (a console driver
+   registration or unregister holding the lock).
+2. pl011 port->lock left locked by an interrupted write.
+3. earlycon vs registered console handoff window
+   ("Warning: unable to open an initial console" precedes the wedge).
+4. printk kthread (CONFIG_PRINTK_INDEX/async printk) never scheduled
+   because scheduler needs a timer tick.
+
+Note 10.4.4 would unify Fault A and B: if console flushing depends on
+the scheduler tick and the tick depends on PPI30, then fixing the
+timer (E3 MMIO timer port) may resurrect the console too.  Cheap
+discriminator next boot: make HB print into a global counter readable
+via /proc (EL1) AND try one `printk` from a busy-wait context AFTER
+PONR to see if console is lock-dead vs flush-starved.
+
+## 10.5. Current three-piece set
+
+| File | md5 |
+|---|---|
+| `/srv/tftp/mv310-Image-7.1.8-gicgrp1` | `a9423cede44295ce845ba3a6309e33ab` |
+| `/srv/tftp/mv310-l-loader-gicgrp1.bin` | `7cfe066218c14f1e2e9f2b33a079ca56` |
+| `/srv/tftp/mv310-tvbox-7.1.8.dtb` | `a1cec64cce8da0bb01cd0e6efd7e59bb` |
+
+Log: `/mnt/hdd/hi3798mv310-stuff/notes/logs/serial-v7.2-hb-live-191606.log`
